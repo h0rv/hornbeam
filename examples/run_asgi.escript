@@ -1,9 +1,8 @@
 #!/usr/bin/env escript
 %%! +S 4:4
-%% Launch one ASGI application using an already built runtime.
-main([Runtime, App, Bind, LifespanText | PythonPaths]) ->
-    Paths = filelib:wildcard(filename:join([Runtime, "_build/default/lib/*/ebin"])) ++
-            filelib:wildcard(filename:join([Runtime, "_build/default/checkouts/*/ebin"])),
+main([Build, App, Bind, LifespanText | PythonPaths]) ->
+    Paths = filelib:wildcard(filename:join([Build, "lib/*/ebin"])) ++
+            filelib:wildcard(filename:join([Build, "checkouts/*/ebin"])),
     ok = code:add_paths(Paths),
     Lifespan = case LifespanText of
         "on" -> on;
@@ -27,5 +26,5 @@ main([Runtime, App, Bind, LifespanText | PythonPaths]) ->
         ServerError -> io:format("HORNBEAM_START_ERROR ~p~n", [ServerError]), halt(1)
     end;
 main(_) ->
-    io:format(standard_error, "Usage: runtime app bind lifespan pythonpath...~n", []),
+    io:format(standard_error, "Usage: build_path app bind lifespan pythonpath...~n", []),
     halt(2).
