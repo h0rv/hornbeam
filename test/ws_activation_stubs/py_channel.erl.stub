@@ -1,0 +1,6 @@
+%% Isolated native input double, not native bridge evidence.
+-module(py_channel).
+-export([new/1, close/1, send/2]).
+new(_Options) -> {ok, make_ref()}.
+close(_Channel) -> ok.
+send(_Channel, _Message) -> ok.

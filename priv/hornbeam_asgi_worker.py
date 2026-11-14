@@ -21,7 +21,8 @@ Design inspired by gunicorn's ASGI worker:
 """
 
 import asyncio
-from typing import Callable, Optional
+from collections.abc import Callable
+from urllib.parse import unquote
 
 try:
     import erlang
@@ -57,7 +58,7 @@ class BodyReceiver:
     def __init__(self, body_ref):
         self._complete = False
         self._disconnected = False
-        self._waiter = None
+        self._waiter: asyncio.Future[None] | None = None
         self._chunks = []
 
         # Detect body mode from ref
@@ -71,9 +72,10 @@ class BodyReceiver:
             if tag == b'body' or tag == 'body':
                 self._mode = 'inline'
                 data = body_ref[1]
-                # Ensure bytes (Erlang binary may decode as str)
-                if isinstance(data, str):
-                    data = data.encode('latin-1')
+                # Erlang supplies {bytes, Binary}; never reconstruct wire
+                # bytes from text after the converter has decoded them.
+                if not isinstance(data, bytes):
+                    raise TypeError('inline ASGI request body must be bytes')
                 self._data = data
                 self._channel = None
             elif tag == b'channel' or tag == 'channel':
@@ -105,10 +107,13 @@ class BodyReceiver:
         """ASGI receive callable with fast paths."""
         # Already disconnected
         if self._disconnected:
+            # Even repeated disconnect reads must let other tasks run.
+            await asyncio.sleep(0)
             return _DISCONNECT_MSG
 
-        # Fast path: empty body
+        # Deliver one request event, including for an empty body.
         if self._mode == 'empty':
+            self._mode = 'done'
             return _EMPTY_BODY_MSG
 
         # Fast path: inline body (complete body passed directly)
@@ -118,7 +123,7 @@ class BodyReceiver:
 
         # Body already consumed
         if self._mode == 'done' or self._complete:
-            return _EMPTY_BODY_MSG
+            return await self._wait_disconnect()
 
         # Fast path: chunks already buffered
         if self._chunks:
@@ -126,6 +131,20 @@ class BodyReceiver:
 
         # Channel mode: read from ByteChannel
         return await self._receive_from_channel()
+
+    async def _wait_disconnect(self) -> dict[str, str]:
+        """Body EOF is not a disconnect; suspend until explicitly signalled."""
+        if self._waiter is not None:
+            message = "concurrent ASGI receive calls are not supported"
+            raise RuntimeError(message)
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiter = waiter
+        try:
+            while not self._disconnected:
+                await waiter
+            return _DISCONNECT_MSG
+        finally:
+            self._waiter = None
 
     def _pop_chunk(self) -> dict:
         """Pop buffered chunk and return message."""
@@ -285,6 +304,12 @@ async def handle_asgi(caller_pid, app_module: str, app_callable: str,
 
     # Get app (cached)
     app = _get_app(app_module, app_callable)
+
+    # livery supplies URI path bytes (or UTF-8 text after conversion).
+    # ASGI paths are decoded Unicode; raw_path remains untouched bytes.
+    scope['path'] = unquote(scope['path'])
+    scope['root_path'] = unquote(scope['root_path'])
+    scope.setdefault('extensions', {})['hornbeam.owner'] = caller_pid
 
     # Use cached state proxy (shared per mount_id)
     mount_id = scope.get('mount_id')

@@ -12,277 +12,290 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 
-%%% @doc WebSocket session handler (ws_handler behaviour) for ASGI apps.
-%%%
-%%% Bridges the ws session to ASGI WebSocket applications through the
-%%% hornbeam_websocket_runner Python module, or to Phoenix-style channels
-%%% when the first text frame is a JSON array of 5 elements.
-%%%
-%%% == ASGI WebSocket Protocol ==
-%%%
-%%% Erlang -> Python (receive):
-%%% - websocket.connect: On WebSocket upgrade
-%%% - websocket.receive: On text/binary frame
-%%% - websocket.disconnect: On close
-%%%
-%%% Python -> Erlang (send):
-%%% - websocket.accept: Accept connection
-%%% - websocket.send: Send text/binary frame
-%%% - websocket.close: Close connection
+%%% @doc Continuous ASGI WebSocket execution, or explicit native channels.
+%%% websocket_protocol => channels opts into Hornbeam's native protocol.
+%%% The default is asgi: no application frame is inspected for routing.
+%%% The transport upgrades before init/2, so application handshake denial,
+%%% headers and subprotocol selection still require a separate transport API.
 -module(hornbeam_ws_handler).
-
 -behaviour(ws_handler).
+-export([init/2, handle_in/2, handle_info/2, terminate/2, output/1]).
 
--export([init/2, handle_in/2, handle_info/2, terminate/2]).
+-define(OUTPUT_TIMEOUT, 5000).
 
 -record(state, {
-    scope :: map(),
-    app_module :: binary(),
-    app_callable :: binary(),
     session_id :: binary(),
+    transport_pid :: pid(),
+    mode = asgi :: asgi | channels,
     accepted = false :: boolean(),
+    closing = false :: boolean(),
     subprotocol :: binary() | undefined,
-    subscriptions = [] :: [term()],
-    %% Channel protocol support
-    mode = undefined :: undefined | asgi | channel,
-    channel_pid :: pid() | undefined
+    channel_pid :: pid() | undefined,
+    input :: reference() | undefined,
+    input_guard :: pid() | undefined,
+    task_ref :: reference() | undefined,
+    max_output_frame = 16777216 :: pos_integer()
 }).
 
-%% @doc Session start after a successful upgrade handshake.
-%%
-%% `Opts' comes from hornbeam_websocket:upgrade/2. The ws `Req' map
-%% carries the socket peer, which the upgrade-time scope could not know.
 init(Req, Opts) ->
     Scope0 = maps:get(scope, Opts),
-    Scope = case maps:get(peer, Req, undefined) of
+    Scope1 = case maps:get(peer, Req, undefined) of
         {Ip, Port} ->
             Scope0#{<<"client">> => [hornbeam_request:format_ip(Ip), Port]};
-        _ ->
-            Scope0
+        _ -> Scope0
     end,
+    Extensions = maps:get(<<"extensions">>, Scope1, #{}),
+    Scope = Scope1#{<<"extensions">> => Extensions#{<<"hornbeam.owner">> => self()}},
     SessionId = maps:get(session_id, Opts),
-    State = #state{
-        scope = Scope,
-        app_module = maps:get(app_module, Opts),
-        app_callable = maps:get(app_callable, Opts),
-        session_id = SessionId
-    },
-
-    %% Register session
+    State = #state{session_id = SessionId, transport_pid = self(),
+                   mode = maps:get(websocket_protocol, Opts, asgi)},
     hornbeam_websocket:register_session(SessionId, self()),
-
-    %% Auto-subscribe to pubsub topic based on path (e.g., /chat/general -> chat:general)
-    Path = maps:get(<<"path">>, Scope, <<>>),
-    Topic = path_to_topic(Path),
-    case Topic of
-        undefined -> ok;
-        _ -> hornbeam_pubsub:subscribe(Topic, self())
-    end,
-
-    %% Start Python WebSocket session
-    case start_websocket_session(State) of
-        {ok, Response} ->
-            handle_connect_response(Response, State#state{subscriptions = [Topic]});
-        {error, Reason} ->
+    case State#state.mode of
+        asgi -> start_asgi(Scope, Opts, State);
+        channels -> start_channels(State);
+        _ ->
             hornbeam_websocket:unregister_session(SessionId),
-            error_logger:error_msg("WebSocket init error: ~p~n", [Reason]),
-            {stop, ws_init_failed, State}
+            {stop, invalid_websocket_protocol, State}
     end.
 
-%% Convert URL path to pubsub topic: /chat/general -> <<"chat:general">>
-path_to_topic(<<"/", Rest/binary>>) ->
-    binary:replace(Rest, <<"/">>, <<":">>, [global]);
-path_to_topic(_) ->
-    undefined.
-
-%% @doc Handle incoming WebSocket frames.
-handle_in({text, Data}, #state{mode = undefined} = State) ->
-    %% First message - detect protocol
-    handle_first_message(text, Data, State);
-handle_in({text, Data}, #state{mode = channel, channel_pid = Pid} = State) ->
-    %% Channel protocol mode - route to channel process
+handle_in({text, Data}, #state{mode = channels, channel_pid = Pid} = State) ->
     handle_channel_message(text, Data, Pid, State);
-handle_in({text, Data}, #state{mode = asgi} = State) ->
-    %% ASGI mode - standard handling
+handle_in({binary, _Data}, #state{mode = channels} = State) ->
+    %% Native channels remain text-only.
+    {ok, State};
+handle_in({text, Data}, State) ->
     handle_receive(text, Data, State);
-handle_in({binary, Data}, #state{mode = undefined} = State) ->
-    %% Binary data - assume ASGI mode
-    State1 = State#state{mode = asgi},
-    handle_receive(binary, Data, State1);
-handle_in({binary, Data}, #state{mode = channel, channel_pid = Pid} = State) ->
-    %% Channel protocol doesn't use binary, but forward anyway
-    handle_channel_message(binary, Data, Pid, State);
-handle_in({binary, Data}, #state{mode = asgi} = State) ->
+handle_in({binary, Data}, State) ->
     handle_receive(binary, Data, State);
-handle_in({ping, _}, State) ->
-    %% ws_session already replied with a pong
-    {ok, State};
-handle_in({pong, _}, State) ->
-    {ok, State};
 handle_in(_Frame, State) ->
+    %% ws_session answers ping before invoking the handler.
     {ok, State}.
 
-%% @doc Handle Erlang messages sent to the WebSocket session process.
-handle_info({websocket_send, text, Data}, State) ->
+%% Direct output from the running Python task. Binary tags match erlang.send
+%% conventions in hornbeam_asgi_worker. Never wait for an inbound frame.
+handle_info({<<"websocket_accept">>, Subprotocol}, State) ->
+    {ok, State#state{accepted = true, subprotocol = Subprotocol}};
+handle_info({<<"websocket_send">>, <<"text">>, Data}, #state{closing = false} = State) ->
     {reply, {text, Data}, State};
-handle_info({websocket_send, binary, Data}, State) ->
+handle_info({<<"websocket_send">>, <<"binary">>, Data}, #state{closing = false} = State) ->
+    {reply, {binary, Data}, State};
+handle_info({<<"websocket_close">>, Code, Reason}, State) ->
+    close_reply(Code, Reason, State);
+handle_info({<<"websocket_broadcast">>, Topic, Message}, State) ->
+    hornbeam_pubsub:publish(Topic, Message),
+    {ok, State};
+handle_info({async_result, Ref, Result}, #state{task_ref = Ref} = State) ->
+    close_input(State),
+    State1 = State#state{input = undefined, input_guard = undefined, task_ref = undefined},
+    case {State1#state.closing, Result} of
+        {true, _} -> {ok, State1};
+        {false, {ok, _}} -> close_reply(1000, <<>>, State1);
+        {false, {error, Reason}} ->
+            error_logger:error_msg("WebSocket task failed: ~p~n", [Reason]),
+            close_reply(1011, <<"Application error">>, State1)
+    end;
+%% Preserve direct output from native channels and existing pubsub callers.
+handle_info({websocket_send, text, Data}, #state{closing = false} = State) ->
+    {reply, {text, Data}, State};
+handle_info({websocket_send, binary, Data}, #state{closing = false} = State) ->
     {reply, {binary, Data}, State};
 handle_info({websocket_close, Code, Reason}, State) ->
-    {reply, {close, Code, Reason}, State};
+    close_reply(Code, Reason, State);
 handle_info({websocket_close, Code}, State) ->
-    {reply, {close, Code, <<>>}, State};
-%% Handle pubsub messages - forward to WebSocket as JSON (ASGI mode only)
-handle_info({pubsub, _Topic, Message}, #state{mode = asgi} = State) when is_map(Message) ->
-    Json = json:encode(Message),
-    {reply, {text, Json}, State};
-handle_info({pubsub, _Topic, Message}, #state{mode = asgi} = State) when is_binary(Message) ->
+    close_reply(Code, <<>>, State);
+handle_info({pubsub, _Topic, Message}, #state{mode = asgi, closing = false} = State)
+  when is_map(Message) ->
+    {reply, {text, json:encode(Message)}, State};
+handle_info({pubsub, _Topic, Message}, #state{mode = asgi, closing = false} = State)
+  when is_binary(Message) ->
     {reply, {text, Message}, State};
-handle_info({pubsub, _Topic, _Message}, #state{mode = channel} = State) ->
-    %% Channel mode handles pubsub through the channel process
-    {ok, State};
-%% Handle channel process death
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, #state{channel_pid = Pid} = State) ->
-    %% Channel process died - close WebSocket
-    {reply, {close, 1011, <<"Channel terminated">>}, State#state{channel_pid = undefined}};
+    close_reply(1011, <<"Channel terminated">>, State#state{channel_pid = undefined});
 handle_info(_Info, State) ->
     {ok, State}.
 
-%% @doc Handle WebSocket termination.
-terminate(Reason, #state{session_id = SessionId,
-                         mode = Mode,
+terminate(Reason, #state{session_id = SessionId, input = Input,
                          channel_pid = ChannelPid} = State) ->
-    %% Unregister session from pubsub
     hornbeam_websocket:unregister_session(SessionId),
-    %% Handle mode-specific cleanup
-    _ = case Mode of
-        channel when is_pid(ChannelPid) ->
-            %% Stop the channel process (it will handle cleanup)
-            _ = try gen_server:stop(ChannelPid, normal, 5000)
-                catch _:_ -> ok
-                end,
-            ok;
-        asgi ->
-            %% Send disconnect event to Python ASGI app
-            Code = reason_to_code(Reason),
-            _ = send_disconnect(State, Code);
+    case Input of
+        undefined -> ok;
         _ ->
-            ok
+            %% Queue the peer's code before EOF. If the bounded channel is
+            %% already full, EOF still wakes the independent Python pump.
+            _ = py_channel:send(Input, {<<"disconnect">>, reason_to_code(Reason)}),
+            close_input(State)
+    end,
+    case ChannelPid of
+        undefined -> ok;
+        _ ->
+            try gen_server:stop(ChannelPid, normal, 5000)
+            catch _:_ -> ok
+            end
     end,
     ok;
 terminate(_Reason, _State) ->
-    %% Session torn down before init completed
     ok.
 
-%%% ============================================================================
-%%% Internal Functions
-%%% ============================================================================
+%%% Internal functions
 
-start_websocket_session(#state{app_module = AppModule, app_callable = AppCallable,
-                               scope = Scope, session_id = SessionId}) ->
-    Timeout = hornbeam_config:get_config(timeout),
-    TimeoutMs = case Timeout of
-        undefined -> 30000;
-        T -> T
-    end,
-    py:call(hornbeam_websocket_runner, start_session,
-            [AppModule, AppCallable, Scope, SessionId], #{}, TimeoutMs).
-
-handle_connect_response(Response, State) ->
-    case maps:get(<<"type">>, Response, undefined) of
-        <<"websocket.accept">> ->
-            Subprotocol = maps:get(<<"subprotocol">>, Response, undefined),
-            NewState = State#state{accepted = true, subprotocol = Subprotocol},
-            %% Connection accepted, continue with WebSocket
-            {ok, NewState};
-        <<"websocket.close">> ->
-            Code = maps:get(<<"code">>, Response, 1000),
-            Reason = maps:get(<<"reason">>, Response, <<>>),
-            {reply, {close, Code, Reason}, State};
-        _ ->
-            %% Unknown response, close connection
-            {reply, {close, 1002, <<"Protocol error">>}, State}
-    end.
-
-handle_receive(Type, Data, #state{session_id = SessionId,
-                                  app_module = AppModule,
-                                  app_callable = AppCallable} = State) ->
-    Timeout = hornbeam_config:get_config(timeout),
-    TimeoutMs = case Timeout of
-        undefined -> 30000;
-        T -> T
-    end,
-
-    TypeStr = case Type of
-        text -> <<"text">>;
-        binary -> <<"bytes">>
-    end,
-
-    case py:call(hornbeam_websocket_runner, receive_message,
-                 [AppModule, AppCallable, SessionId, TypeStr, Data], #{}, TimeoutMs) of
-        {ok, Responses} when is_list(Responses) ->
-            process_responses(Responses, State);
-        {ok, Response} when is_map(Response) ->
-            process_responses([Response], State);
+start_asgi(Scope, Opts, State) ->
+    %% Two maximum-sized frames plus term encoding overhead. Python's local
+    %% queue is also bounded; sustained backpressure closes with 1013, not blocking
+    %% the socket process or silently dropping application messages.
+    MaxFrame = maps:get(max_frame_size, Opts, 16777216),
+    case py_channel:new(#{max_size => MaxFrame * 2 + 65536}) of
+        {ok, Input} ->
+            Owner = self(),
+            TaskRef = make_ref(),
+            RelayState = State#state{input = Input, task_ref = TaskRef,
+                                     max_output_frame = MaxFrame},
+            Guard = spawn(fun() -> relay_output(Owner, RelayState) end),
+            State1 = State#state{input = Input, input_guard = Guard,
+                                 task_ref = TaskRef},
+            case submit_asgi(Scope, Opts, State1) of
+                {ok, State2} ->
+                    %% Keep the legacy path-based pubsub API in ASGI mode.
+                    case path_to_topic(maps:get(<<"path">>, Scope, <<>>)) of
+                        undefined -> ok;
+                        Topic -> hornbeam_pubsub:subscribe(Topic, self())
+                    end,
+                    {ok, State2};
+                {error, Reason} ->
+                    close_input(State1),
+                    hornbeam_websocket:unregister_session(State#state.session_id),
+                    error_logger:error_msg("WebSocket init error: ~p~n", [Reason]),
+                    {stop, ws_init_failed, State1}
+            end;
         {error, Reason} ->
-            error_logger:error_msg("WebSocket receive error: ~p~n", [Reason]),
-            {reply, {close, 1011, <<"Server error">>}, State}
+            hornbeam_websocket:unregister_session(State#state.session_id),
+            {stop, {ws_input_failed, Reason}, State}
     end.
 
-process_responses([], State) ->
-    {ok, State};
-process_responses(Responses, State) ->
-    %% First, handle any broadcast requests
-    lists:foreach(fun(Response) ->
-        case maps:get(<<"type">>, Response, undefined) of
-            <<"hornbeam.broadcast">> ->
-                Topic = maps:get(<<"topic">>, Response),
-                Message = maps:get(<<"message">>, Response),
-                hornbeam_pubsub:publish(Topic, Message);
-            _ ->
-                ok
-        end
-    end, Responses),
-    %% Then collect WebSocket frames to send
-    Frames = lists:filtermap(fun(Response) ->
-        case maps:get(<<"type">>, Response, undefined) of
-            <<"websocket.send">> ->
-                case maps:get(<<"text">>, Response, undefined) of
-                    undefined ->
-                        case maps:get(<<"bytes">>, Response, undefined) of
-                            undefined -> false;
-                            Bytes -> {true, {binary, Bytes}}
-                        end;
-                    Text -> {true, {text, Text}}
-                end;
-            <<"websocket.close">> ->
-                Code = maps:get(<<"code">>, Response, 1000),
-                Reason = maps:get(<<"reason">>, Response, <<>>),
-                {true, {close, Code, Reason}};
-            _ ->
-                false
-        end
-    end, Responses),
-    case Frames of
-        [] -> {ok, State};
-        _ -> {reply, Frames, State}
-    end.
-
-send_disconnect(#state{app_module = AppModule, app_callable = AppCallable,
-                       session_id = SessionId}, Code) ->
-    Timeout = hornbeam_config:get_config(timeout),
-    TimeoutMs = case Timeout of
-        undefined -> 5000;  % Shorter timeout for disconnect
-        T -> min(T, 5000)
-    end,
+submit_asgi(Scope, Opts, #state{input = Input, session_id = SessionId,
+                               input_guard = Relay, task_ref = TaskRef} = State) ->
     try
-        py:call(hornbeam_websocket_runner, disconnect,
-                [AppModule, AppCallable, SessionId, Code], #{}, TimeoutMs)
+        {ok, LoopRef} = py_event_loop_pool:get_loop(),
+        ok = py_nif:submit_task(LoopRef, Relay, TaskRef,
+            <<"hornbeam_websocket_runner">>, <<"handle_websocket">>,
+            [self(), maps:get(app_module, Opts), maps:get(app_callable, Opts),
+             Scope, SessionId, Input, Relay], #{}),
+        {ok, State#state{task_ref = TaskRef}}
     catch
-        _:_ -> ok
+        Class:Reason -> {error, {Class, Reason}}
     end.
 
-%% The peer's own close code when it sent one (livery >= 0.7.0);
-%% otherwise derived from the local terminate reason.
+output([Owner, Relay, <<"abort">>]) when is_pid(Owner), is_pid(Relay) ->
+    exit(Owner, kill),
+    0;
+output([Owner, Relay, Message]) when is_pid(Owner), is_pid(Relay) ->
+    try gen_server:call(Relay, {output, Message}, ?OUTPUT_TIMEOUT + 1000)
+    catch
+        exit:_ ->
+            exit(Owner, kill),
+            0
+    end.
+
+relay_output(Owner, State) ->
+    Ref = erlang:monitor(process, Owner),
+    relay_output(Owner, Ref, State).
+
+relay_output(Owner, Ref, #state{input = Input, task_ref = TaskRef} = State) ->
+    receive
+        {'DOWN', Ref, process, Owner, _} ->
+            py_channel:close(Input),
+            hornbeam_websocket:unregister_session(State#state.session_id);
+        stop ->
+            erlang:demonitor(Ref, [flush]),
+            py_channel:close(Input);
+        {'$gen_call', From, {output, Message}} ->
+            case relay_send(Owner, Message, State) of
+                {ok, State1} ->
+                    gen_server:reply(From, 1),
+                    relay_output(Owner, Ref, State1);
+                {error, _} ->
+                    exit(Owner, kill),
+                    py_channel:close(Input),
+                    hornbeam_websocket:unregister_session(State#state.session_id),
+                    gen_server:reply(From, 0)
+            end;
+        Info ->
+            case relay_send(Owner, Info, State) of
+                {ok, State1} ->
+                    case Info of
+                        {async_result, TaskRef, _} ->
+                            erlang:demonitor(Ref, [flush]),
+                            ok;
+                        _ -> relay_output(Owner, Ref, State1)
+                    end;
+                {error, _} ->
+                    exit(Owner, kill),
+                    py_channel:close(Input),
+                    hornbeam_websocket:unregister_session(State#state.session_id)
+            end
+    end.
+
+relay_send(_Owner, {<<"websocket_send">>, _, Data},
+           #state{max_output_frame = Max}) when byte_size(Data) > Max ->
+    {error, frame_too_large};
+relay_send(_Owner, {<<"websocket_send">>, _, _}, #state{closing = true}) ->
+    {error, closing};
+relay_send(_Owner, {<<"websocket_accept">>, _}, #state{closing = true}) ->
+    {error, closing};
+relay_send(Owner, Info, State) ->
+    case handle_info(Info, State) of
+        {ok, Next = #state{closing = true}} when State#state.closing =:= false ->
+            case ws_session:send_sync(Owner, [], ?OUTPUT_TIMEOUT) of
+                {error, closing} -> {ok, Next};
+                {error, _} = Error -> Error;
+                ok -> {error, close_not_started}
+            end;
+        {ok, Next} -> {ok, Next};
+        {reply, Frames, Next} ->
+            case ws_session:send_sync(Owner, Frames, ?OUTPUT_TIMEOUT) of
+                ok -> {ok, Next};
+                {error, _} = Error -> Error
+            end
+    end.
+
+close_input(#state{input = undefined}) -> ok;
+close_input(#state{input = Input, input_guard = Guard}) ->
+    py_channel:close(Input),
+    case Guard of
+        undefined -> ok;
+        _ -> Guard ! stop
+    end,
+    ok.
+
+handle_receive(_Type, _Data, #state{closing = true} = State) ->
+    {ok, State};
+handle_receive(_Type, _Data, #state{input = undefined} = State) ->
+    close_reply(1011, <<"Application finished">>, State);
+handle_receive(Type, Data, #state{input = Input} = State) ->
+    %% Force bytes even for valid UTF-8 binary frames. Text is decoded once
+    %% in Python; arbitrary five-item JSON arrays remain application input.
+    case py_channel:send(Input, {atom_to_binary(Type), {bytes, Data}}) of
+        ok -> {ok, State};
+        busy ->
+            close_input(State),
+            close_reply(1013, <<"Application input channel full">>, State);
+        {error, _} ->
+            close_reply(1011, <<"Application finished">>, State)
+    end.
+
+close_reply(_Code, _Reason, #state{closing = true} = State) ->
+    {ok, State};
+close_reply(Code, Reason, #state{transport_pid = Owner} = State) ->
+    %% A reply frame alone leaves ws_session open with close_sent=false.
+    %% Use its close command to enter closing and arm the close timeout.
+    %% EOF lets Python finish cooperatively, with its own bounded grace period.
+    close_input(State#state{input_guard = undefined}),
+    ws_session:close(Owner, Code, Reason),
+    {ok, State#state{closing = true}}.
+
+path_to_topic(<<"/", Rest/binary>>) ->
+    binary:replace(Rest, <<"/">>, <<":">>, [global]);
+path_to_topic(_) -> undefined.
+
 reason_to_code({remote, Code, _Reason}) when is_integer(Code) -> Code;
 reason_to_code(remote) -> 1005;
 reason_to_code(normal) -> 1000;
@@ -291,53 +304,25 @@ reason_to_code(timeout) -> 1002;
 reason_to_code({transport_error, _}) -> 1006;
 reason_to_code(_) -> 1006.
 
-%%% ============================================================================
-%%% Channel Protocol Support
-%%% ============================================================================
+%%% Explicit native channel protocol (never starts an ASGI application).
 
-%% @doc Handle first message to detect protocol.
-%% Channel protocol uses JSON arrays: [join_ref, ref, topic, event, payload]
-handle_first_message(text, Data, State) ->
-    case try_parse_channel_message(Data) of
-        {ok, Message} when is_list(Message), length(Message) =:= 5 ->
-            %% Detected channel protocol
-            start_channel_mode(Message, State);
-        _ ->
-            %% Not channel protocol, use ASGI mode
-            State1 = State#state{mode = asgi},
-            handle_receive(text, Data, State1)
-    end.
-
-try_parse_channel_message(Data) ->
-    try
-        {ok, json:decode(Data)}
-    catch
-        _:_ -> error
-    end.
-
-start_channel_mode(Message, #state{session_id = SessionId} = State) ->
-    %% Start channel process for this connection
+start_channels(#state{session_id = SessionId} = State) ->
     case hornbeam_channel:start_link(self(), SessionId) of
         {ok, Pid} ->
-            %% Monitor the channel process
             _ = erlang:monitor(process, Pid),
-            %% Route the initial message
-            hornbeam_channel:handle_message(Pid, Message),
-            {ok, State#state{mode = channel, channel_pid = Pid, accepted = true}};
+            {ok, State#state{channel_pid = Pid, accepted = true}};
         {error, Reason} ->
+            hornbeam_websocket:unregister_session(SessionId),
             error_logger:error_msg("Failed to start channel process: ~p~n", [Reason]),
-            {reply, {close, 1011, <<"Server error">>}, State}
+            {stop, ws_channel_failed, State}
     end.
 
 handle_channel_message(text, Data, Pid, State) ->
-    case try_parse_channel_message(Data) of
-        {ok, Message} ->
+    try json:decode(Data) of
+        Message when is_list(Message), length(Message) =:= 5 ->
             hornbeam_channel:handle_message(Pid, Message),
             {ok, State};
-        error ->
-            %% Invalid JSON - close connection
-            {reply, {close, 1007, <<"Invalid JSON">>}, State}
-    end;
-handle_channel_message(binary, _Data, _Pid, State) ->
-    %% Channel protocol is text-only
-    {ok, State}.
+        _ -> close_reply(1007, <<"Invalid channel message">>, State)
+    catch
+        _:_ -> close_reply(1007, <<"Invalid JSON">>, State)
+    end.

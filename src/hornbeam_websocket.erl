@@ -58,6 +58,9 @@ upgrade(Req, State) ->
         app_module => AppModule,
         app_callable => AppCallable,
         session_id => SessionId,
+        %% Native channel compatibility is opt-in, never inferred from JSON.
+        websocket_protocol => maps:get(websocket_protocol,
+                                        hornbeam_config:get_config(), asgi),
         idle_timeout => get_value(WsTimeout, 60000),
         max_frame_size => get_value(MaxFrameSize, 16777216),
         compress => get_value(Compress, false) =:= true
@@ -75,7 +78,7 @@ build_websocket_scope(Req, State) ->
     {Host, Port} = hornbeam_request:server_info(Req, State),
 
     %% Convert headers to list of [name, value] pairs
-    HeaderList = [[Name, Value] || {Name, Value} <- Headers],
+    HeaderList = [[{bytes, Name}, {bytes, Value}] || {Name, Value} <- Headers],
 
     %% Get WebSocket subprotocols from Sec-WebSocket-Protocol header
     Subprotocols = get_subprotocols(Req),
@@ -97,8 +100,8 @@ build_websocket_scope(Req, State) ->
         <<"method">> => livery_req:method(Req),
         <<"scheme">> => WsScheme,
         <<"path">> => Path,
-        <<"raw_path">> => Path,
-        <<"query_string">> => livery_req:query(Req),
+        <<"raw_path">> => {bytes, Path},
+        <<"query_string">> => {bytes, livery_req:query(Req)},
         <<"root_path">> => <<>>,
         <<"headers">> => HeaderList,
         <<"server">> => [Host, Port],

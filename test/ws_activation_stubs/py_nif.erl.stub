@@ -1,0 +1,17 @@
+%% Deterministic native task double, only loaded in the isolated WS tests.
+-module(py_nif).
+-export([submit_task/7]).
+submit_task(_Loop, Caller, Ref, _Module, _Function,
+            [Owner, _App, _Callable, Scope, _Session, _Input, Relay], _Kwargs) ->
+    true = Owner =/= Relay,
+    Owner = maps:get(<<"hornbeam.owner">>, maps:get(<<"extensions">>, Scope)),
+    Relay ! {<<"websocket_accept">>, <<>>},
+    Relay ! {<<"websocket_send">>, <<"text">>, <<"immediate">>},
+    Relay ! {<<"websocket_send">>, <<"binary">>, <<0, 255>>},
+    case maps:get(<<"close_now">>, Scope, false) of
+        true ->
+            Relay ! {<<"websocket_close">>, 1008, <<"policy">>},
+            Caller ! {async_result, Ref, {ok, <<"done">>}};
+        false -> ok
+    end,
+    ok.

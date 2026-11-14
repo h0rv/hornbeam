@@ -240,6 +240,7 @@ stop() ->
         fun hornbeam_hooks:clear/0,
         fun hornbeam_channel_registry:clear/0,
         fun hornbeam_presence:clear/0,
+        fun hornbeam_services:reset/0,
         fun hornbeam_state:clear/0,
         fun hornbeam_config:reset/0
     ]],
@@ -988,6 +989,9 @@ ensure_binary(V) when is_atom(V) -> atom_to_binary(V, utf8).
 
 %% Register hornbeam functions so Python can call them via erlang.call()
 register_python_callbacks() ->
+    py:register_function(hornbeam_ws_output, fun hornbeam_ws_handler:output/1),
+    %% Generic async-call service boundary; no application framework dependency.
+    py:register_function(hornbeam_services, fun hornbeam_services:callback/1),
     %% Hook registration (called from Python to register/unregister hooks)
     py:register_function(hornbeam_hooks, fun([Action, Args]) ->
         dispatch_hooks_action(Action, Args)

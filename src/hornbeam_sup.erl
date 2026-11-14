@@ -103,6 +103,14 @@ init([]) ->
             modules => [hornbeam_pubsub]
         },
         #{
+            id => hornbeam_services,
+            start => {hornbeam_services, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [hornbeam_services]
+        },
+        #{
             id => hornbeam_lifespan,
             start => {hornbeam_lifespan, start_link, []},
             restart => permanent,
