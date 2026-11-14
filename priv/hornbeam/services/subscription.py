@@ -1,6 +1,6 @@
 import asyncio
 from types import TracebackType
-from typing import NoReturn, Self
+from typing import TYPE_CHECKING, NoReturn, Self
 
 from hornbeam._shared.lifecycle import await_cleanup
 from hornbeam.api.errors import (
@@ -8,9 +8,7 @@ from hornbeam.api.errors import (
     SubscriptionClosed,
     SubscriptionOverflow,
 )
-from hornbeam.services._bridge import (
-    Bridge,
-    NativeChannel,
+from hornbeam.services._wire import (
     Status,
     acknowledged,
     event,
@@ -18,13 +16,15 @@ from hornbeam.services._bridge import (
     status,
 )
 
+if TYPE_CHECKING:
+    from erlang import Channel
+
 
 class Subscription:
     """One owned native channel with at most one pending receive."""
 
     def __init__(
         self,
-        bridge: Bridge,
         owner: object,
         token: bytes,
         timeout: float,
@@ -34,11 +34,10 @@ class Subscription:
         self._topic = topic
         self._max_bytes = max_bytes
         self._entered = False
-        self._bridge = bridge
         self._owner = owner
         self._token = token
         self._timeout = timeout
-        self._channel: NativeChannel | None = None
+        self._channel: Channel | None = None
         self._pending: asyncio.Task[bytes] | None = None
         self._receiving = False
         self._closed = False
@@ -46,16 +45,20 @@ class Subscription:
         self._cleanup: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> Self:
+        from erlang import Channel, async_call
+
         if self._entered or self._closed:
             raise SubscriptionClosed("subscription context cannot be reused")
         self._entered = True
         try:
             resource = result(
-                await self._bridge.call(
-                    "subscribe", [self._owner, self._token, self._topic, self._max_bytes]
+                await async_call(
+                    "hornbeam_services",
+                    "subscribe",
+                    [self._owner, self._token, self._topic, self._max_bytes],
                 )
             )
-            self._channel = self._bridge.channel(resource)
+            self._channel = Channel(resource)
             if self._closed:
                 self._raise_closed()
             return self
@@ -100,19 +103,28 @@ class Subscription:
             self._pending = None
             self._receiving = False
 
-    async def _receive(self, channel: NativeChannel) -> bytes:
-        payload = event(await channel.async_receive(native_only=True))
+    async def _receive(self, channel: Channel) -> bytes:
+        from erlang import ChannelClosed, async_call
+
+        try:
+            raw = await channel.async_receive(native_only=True)
+        except ChannelClosed:
+            if self._closed:
+                self._raise_closed()
+            self._terminal = status(
+                await async_call(
+                    "hornbeam_services", "subscription_status", [self._owner, self._token]
+                )
+            )
+            if self._terminal == "open":
+                raise RuntimeProtocolError(
+                    "native channel closed while runtime reports open"
+                ) from None
+            self._closed = True
+            self._raise_closed()
         if self._closed:
             self._raise_closed()
-        if payload is not None:
-            return payload
-        self._terminal = status(
-            await self._bridge.call("subscription_status", [self._owner, self._token])
-        )
-        if self._terminal == "open":
-            raise RuntimeProtocolError("native channel closed while runtime reports open")
-        self._closed = True
-        return self._raise_closed()
+        return event(raw)
 
     def __aiter__(self) -> Self:
         return self
@@ -124,13 +136,19 @@ class Subscription:
             raise StopAsyncIteration from None
 
     async def _close(self) -> None:
+        from erlang import async_call
+
         try:
             async with asyncio.timeout(self._timeout):
                 pending = self._pending
                 if pending is not None:
                     pending.cancel()
                 try:
-                    acknowledged(await self._bridge.call("unsubscribe", [self._owner, self._token]))
+                    acknowledged(
+                        await async_call(
+                            "hornbeam_services", "unsubscribe", [self._owner, self._token]
+                        )
+                    )
                 finally:
                     if pending is not None:
                         await asyncio.gather(pending, return_exceptions=True)

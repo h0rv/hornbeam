@@ -1,51 +1,7 @@
 from collections.abc import Mapping
-from typing import Literal, Protocol, TypeIs
+from typing import Literal, TypeIs
 
 from hornbeam.api.errors import RuntimeProtocolError, RuntimeUnavailable
-
-
-class NativeChannel(Protocol):
-    async def async_receive(self, *, native_only: bool = False) -> object: ...
-
-
-type ServiceAction = Literal[
-    "owner",
-    "cache_set",
-    "cache_get",
-    "cache_delete",
-    "cache_clear",
-    "cache_exists",
-    "cache_ttl",
-    "counter_incr",
-    "publish",
-    "subscribe",
-    "unsubscribe",
-    "subscription_status",
-    "subscription_count",
-]
-
-
-class Bridge(Protocol):
-    async def call(self, action: ServiceAction, args: list[object]) -> object: ...
-    def channel(self, resource: object) -> NativeChannel: ...
-
-
-class NativeBridge:
-    def __init__(self) -> None:
-        try:
-            import erlang
-        except ImportError as exc:
-            raise RuntimeUnavailable("Beam.connect() requires the Hornbeam embedding") from exc
-        self._erlang = erlang
-
-    async def call(self, action: ServiceAction, args: list[object]) -> object:
-        try:
-            return await self._erlang.async_call("hornbeam_services", action, args)
-        except (ImportError, RuntimeError, AttributeError) as exc:
-            raise RuntimeUnavailable("Hornbeam callback failed: {}".format(action)) from exc
-
-    def channel(self, resource: object) -> NativeChannel:
-        return self._erlang.Channel(resource)
 
 
 def _tuple(value: object) -> TypeIs[tuple[object, ...]]:
@@ -123,11 +79,9 @@ def byte_value(value: object) -> bytes:
     return value
 
 
-def event(raw: object) -> bytes | None:
-    if raw is None:
-        return None
+def event(raw: object) -> bytes:
     if not _pair(raw) or raw[0] not in (b"event", "event"):
-        raise RuntimeProtocolError("expected an event envelope or channel closure")
+        raise RuntimeProtocolError("expected an event envelope")
     payload = byte_value(raw[1])
     if len(payload) > 65536:
         raise RuntimeProtocolError("event payload exceeds 65536 bytes")
