@@ -2,9 +2,11 @@
 %% Run in a fresh VM: test/ws_activation_stubs must not shadow a live runtime.
 -module(hornbeam_ws_activation_regression_tests).
 -include_lib("eunit/include/eunit.hrl").
--export([send/2, activate/1, close/1, classify/2, controlling_process/2]).
+-export([send/2, send/3, abort/1, activate/1, close/1, classify/2, controlling_process/2]).
 
 send(Observer, Data) -> Observer ! {transport_send, self(), iolist_to_binary(Data)}, ok.
+send(Observer, Data, _Timeout) -> send(Observer, Data).
+abort(Observer) -> close(Observer).
 activate(Observer) -> Observer ! {transport_active, self()}, ok.
 close(Observer) -> Observer ! {transport_closed, self()}, ok.
 classify(_Message, _Handle) -> ignore.

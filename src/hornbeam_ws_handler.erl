@@ -185,13 +185,13 @@ submit_asgi(Scope, Opts, #state{input = Input, session_id = SessionId,
     end.
 
 output([Owner, Relay, <<"abort">>]) when is_pid(Owner), is_pid(Relay) ->
-    exit(Owner, kill),
+    _ = ws_session:abort(Owner),
     0;
 output([Owner, Relay, Message]) when is_pid(Owner), is_pid(Relay) ->
     try gen_server:call(Relay, {output, Message}, ?OUTPUT_TIMEOUT + 1000)
     catch
         exit:_ ->
-            exit(Owner, kill),
+            _ = ws_session:abort(Owner),
             0
     end.
 
@@ -213,7 +213,7 @@ relay_output(Owner, Ref, #state{input = Input, task_ref = TaskRef} = State) ->
                     gen_server:reply(From, 1),
                     relay_output(Owner, Ref, State1);
                 {error, _} ->
-                    exit(Owner, kill),
+                    _ = ws_session:abort(Owner),
                     py_channel:close(Input),
                     hornbeam_websocket:unregister_session(State#state.session_id),
                     gen_server:reply(From, 0)
@@ -228,7 +228,7 @@ relay_output(Owner, Ref, #state{input = Input, task_ref = TaskRef} = State) ->
                         _ -> relay_output(Owner, Ref, State1)
                     end;
                 {error, _} ->
-                    exit(Owner, kill),
+                    _ = ws_session:abort(Owner),
                     py_channel:close(Input),
                     hornbeam_websocket:unregister_session(State#state.session_id)
             end
