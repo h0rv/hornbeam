@@ -22,7 +22,9 @@ main([Build, App, Bind, LifespanText | PythonPaths]) ->
                 timeout => 30000, websocket_timeout => 60000,
                 websocket_protocol => asgi, pythonpath => PythonPaths},
     case hornbeam:start(App, Options) of
-        ok -> io:format("HORNBEAM_READY~n"), timer:sleep(infinity);
+        ok ->
+            io:format("~nOpen http://~s/~nApplication: ~s~n~n", [Bind, App]),
+            timer:sleep(infinity);
         ServerError -> io:format("HORNBEAM_START_ERROR ~p~n", [ServerError]), halt(1)
     end;
 main(_) ->
