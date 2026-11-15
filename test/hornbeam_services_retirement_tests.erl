@@ -166,6 +166,45 @@ assert_model(Model) ->
         _ -> ok
     end.
 
+%% Also exercise the real application supervisor returned by Beam.connect(),
+%% not just a test process registered under the application owner's name.
+supervised_application_owner_test_() ->
+    {timeout, 30, fun supervised_application_owner/0}.
+
+supervised_application_owner() ->
+    _ = application:load(hornbeam),
+    Settings = [{erlang_python, num_contexts},
+                {erlang_python, event_loop_pool_size}, {hornbeam, context_pool_size}],
+    Previous = [{App, Key, application:get_env(App, Key)} || {App, Key} <- Settings],
+    lists:foreach(fun({App, Key}) -> application:set_env(App, Key, 1) end, Settings),
+    {ok, Started} = application:ensure_all_started(hornbeam),
+    try
+        {<<"ok">>, Owner} = hornbeam_services:call(<<"owner">>, []),
+        ?assertEqual(whereis(hornbeam_sup), Owner),
+        lists:foreach(fun(N) ->
+            Args = [Owner, <<N:128>>],
+            {<<"ok">>, Channel} = hornbeam_services:call(<<"subscribe">>,
+                Args ++ [<<"application-churn">>, 1024]),
+            1 = hornbeam_pubsub:publish(<<"application-churn">>, <<"event">>),
+            ?assertEqual({ok, {<<"event">>, {bytes, <<"event">>}}},
+                py_nif:channel_try_receive(Channel)),
+            {<<"ok">>, true} = hornbeam_services:call(<<"unsubscribe">>, Args),
+            {<<"ok">>, <<"closed">>} =
+                hornbeam_services:call(<<"subscription_finalize">>, Args),
+            {state, _, _, _, Owners, Guardians} = state(),
+            ?assertEqual({#{}, #{}}, {Owners, Guardians}),
+            ?assertEqual(0, ets:info(hornbeam_services_managed, size)),
+            ?assertEqual([], hornbeam_pubsub:get_members(<<"application-churn">>)),
+            ?assert(is_process_alive(Owner))
+        end, lists:seq(1, 512))
+    after
+        lists:foreach(fun application:stop/1, lists:reverse(Started)),
+        lists:foreach(fun
+            ({App, Key, undefined}) -> application:unset_env(App, Key);
+            ({App, Key, {ok, Value}}) -> application:set_env(App, Key, Value)
+        end, Previous)
+    end.
+
 before(A, B, Trace) ->
     length(lists:takewhile(fun(E) -> E =/= A end, Trace)) <
         length(lists:takewhile(fun(E) -> E =/= B end, Trace)).
