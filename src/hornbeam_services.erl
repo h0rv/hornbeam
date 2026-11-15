@@ -256,6 +256,10 @@ dispatch(<<"unsubscribe">>, [Owner, Token], State)
         when is_pid(Owner), node(Owner) =:= node(),
              is_binary(Token), byte_size(Token) =:= 16 ->
     unsubscribe(Owner, Token, State);
+dispatch(<<"subscription_finalize">>, [Owner, Token], State)
+        when is_pid(Owner), node(Owner) =:= node(),
+             is_binary(Token), byte_size(Token) =:= 16 ->
+    finalize_subscription(Owner, Token, State);
 dispatch(<<"subscription_status">>, [Owner, Token], State)
         when is_pid(Owner), node(Owner) =:= node(),
              is_binary(Token), byte_size(Token) =:= 16 ->
@@ -306,7 +310,7 @@ reap_terminal(State) ->
             {Reason, #{flag := _}} ->
                 py_channel:close(Channel),
                 Pid ! subscription_terminal,
-                put_token(Owner, Token, #{status => status(Reason)}, Acc);
+                put_token(Owner, Token, #{status => status(Reason), opened => true}, Acc);
             _ -> Acc
         end
     end, State, State#state.guardians).
@@ -391,6 +395,37 @@ unsubscribe(Owner, Token, State) ->
             end
     end.
 
+%% Only the consumer of a successful, unique open may acknowledge retirement,
+%% after its single unsubscribe has completed. Canceled opens are not retried:
+%% their tombstones must survive a late subscribe from a different process.
+finalize_subscription(Owner, Token, State) ->
+    case token_entry(Owner, Token, State) of
+        #{flag := _} -> {failure(<<"subscription_not_closed">>), State};
+        #{status := Status, opened := true} ->
+            Guardians = maps:filter(fun(Ref, Entry) ->
+                case Entry of
+                    #{owner := Owner, token := Token, pid := Pid} ->
+                        close_entry(Entry, ?CLOSED),
+                        demonitor(Ref, [flush]),
+                        ets:delete(?MANAGED, Pid),
+                        false;
+                    _ -> true
+                end
+            end, State#state.guardians),
+            #{monitor := OwnerRef, tokens := Tokens} = Info =
+                maps:get(Owner, State#state.owners),
+            Remaining = maps:remove(Token, Tokens),
+            Owners = case map_size(Remaining) of
+                0 ->
+                    demonitor(OwnerRef, [flush]),
+                    maps:remove(Owner, State#state.owners);
+                _ -> (State#state.owners)#{Owner => Info#{tokens => Remaining}}
+            end,
+            {success(Status), State#state{owners = Owners, guardians = Guardians}};
+        #{status := Status} -> {success(Status), State};
+        missing -> {success(<<"closed">>), State}
+    end.
+
 reserve_token(Owner, Token, State) ->
     case is_process_alive(Owner) of
         false -> {error, <<"owner_down">>};
@@ -429,7 +464,8 @@ finish_entry(Entry, Reason, State) ->
     #{owner := Owner, token := Token, flag := Flag} = Entry,
     %% A guardian DOWN may arrive after its owner's metadata was removed.
     case maps:is_key(Owner, State#state.owners) of
-        true -> put_token(Owner, Token, #{status => status(atomics:get(Flag, 1))}, State);
+        true -> put_token(Owner, Token,
+            #{status => status(atomics:get(Flag, 1)), opened => true}, State);
         false -> State
     end.
 

@@ -43,6 +43,7 @@ class Subscription:
         self._closed = False
         self._terminal: Status = "open"
         self._cleanup: asyncio.Task[None] | None = None
+        self._retirement: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> Self:
         from erlang import Channel, async_call
@@ -60,6 +61,8 @@ class Subscription:
             )
             self._channel = Channel(resource)
             if self._closed:
+                await self.aclose()
+                await self._retire()
                 self._raise_closed()
             return self
         except BaseException:
@@ -135,6 +138,28 @@ class Subscription:
         except SubscriptionClosed:
             raise StopAsyncIteration from None
 
+    async def _finalize(self) -> None:
+        from erlang import async_call
+
+        try:
+            async with asyncio.timeout(self._timeout):
+                terminal = status(
+                    await async_call(
+                        "hornbeam_services", "subscription_finalize", [self._owner, self._token]
+                    )
+                )
+                if terminal == "open":
+                    raise RuntimeProtocolError("retired subscription still reports open")
+                if self._terminal == "open":
+                    self._terminal = terminal
+        except TimeoutError as exc:
+            raise RuntimeProtocolError("subscription retirement acknowledgement timed out") from exc
+
+    async def _retire(self) -> None:
+        if self._retirement is None:
+            self._retirement = asyncio.create_task(self._finalize())
+        await await_cleanup(self._retirement)
+
     async def _close(self) -> None:
         from erlang import async_call
 
@@ -152,6 +177,10 @@ class Subscription:
                 finally:
                     if pending is not None:
                         await asyncio.gather(pending, return_exceptions=True)
+                # A canceled open has no acknowledged channel. Keep its native
+                # tombstone: its subscribe may still arrive after unsubscribe.
+                if self._channel is not None:
+                    await self._retire()
         except TimeoutError as exc:
             raise RuntimeProtocolError("subscription cleanup acknowledgement timed out") from exc
 

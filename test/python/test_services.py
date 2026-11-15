@@ -122,11 +122,18 @@ class TestDoubleBridge(ModuleType):
             if self.fail_close:
                 return (b"error", b"cleanup_failed")
             token = byte_value(args[1])
-            self.states[token] = b"closed"
+            if self.states.get(token) not in (b"overflow", b"invalid_payload", b"owner_down"):
+                self.states[token] = b"closed"
             channel = self.channels.get(token)
             if channel is not None and channel.queue.empty():
                 channel.close()
             return (b"ok", True)
+        if action == "subscription_finalize":
+            token = byte_value(args[1])
+            terminal = self.states.get(token, b"closed")
+            if terminal not in (b"closed", b"overflow", b"owner_down", b"invalid_payload"):
+                terminal = b"closed"
+            return (b"ok", terminal)
         if action == "subscription_status":
             self.status_started.set()
             await self.status_gate.wait()
@@ -350,6 +357,53 @@ async def test_independent_subscriptions_and_idempotent_close() -> None:
     assert all(len(byte_value(token)) == 16 for token in tokens)
 
 
+async def test_acknowledged_close__retires_once_after_unsubscribe() -> None:
+    bridge = TestDoubleBridge()
+    async with opened(bridge) as subscription:
+        await subscription.aclose()
+        await subscription.aclose()
+    assert [action for action, _ in bridge.calls] == [
+        "subscribe",
+        "unsubscribe",
+        "subscription_finalize",
+    ]
+
+
+async def test_sequential_contexts__finalize_every_acknowledged_open() -> None:
+    bridge = TestDoubleBridge()
+    beam = Beam(bridge, owner="same-live-owner")
+    for _ in range(512):
+        async with beam.subscribe("updates"):
+            pass
+    assert [action for action, _ in bridge.calls] == [
+        "subscribe",
+        "unsubscribe",
+        "subscription_finalize",
+    ] * 512
+
+
+async def test_retirement__rejects_open_status_without_retry() -> None:
+    bridge = TestDoubleBridge()
+    bridge.override["subscription_finalize"] = (b"ok", b"open")
+    with pytest.raises(RuntimeProtocolError, match="still reports open"):
+        async with opened(bridge) as subscription:
+            with pytest.raises(RuntimeProtocolError, match="still reports open"):
+                await subscription.aclose()
+    assert sum(action == "subscription_finalize" for action, _ in bridge.calls) == 1
+
+
+async def test_overflow_close__retains_reason_after_native_retirement() -> None:
+    bridge = TestDoubleBridge()
+    async with opened(bridge) as subscription:
+        token = next(iter(bridge.channels))
+        bridge.states[token] = b"overflow"
+        await subscription.aclose()
+        bridge.states.pop(token)
+        with pytest.raises(SubscriptionOverflow):
+            await subscription.receive()
+    assert sum(action == "subscription_finalize" for action, _ in bridge.calls) == 1
+
+
 async def test_receive_cancel_reuse_and_single_waiter() -> None:
     bridge = TestDoubleBridge()
     async with opened(bridge) as subscription:
@@ -390,6 +444,7 @@ async def test_cancel_during_open_sends_tombstone() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert bridge.states[token] == b"closed"
+    assert all(action != "subscription_finalize" for action, _ in bridge.calls)
     bridge.open_gate.set()
     await bridge.call("subscribe", ["request-owner", token, b"updates", 65536])
     assert bridge.states[token] == b"closed"
@@ -503,6 +558,7 @@ async def test_close_before_open_ack_never_yields_subscription() -> None:
         await opening
     assert await Beam(bridge, owner="o").subscription_count() == 0
     assert sum(action == "unsubscribe" for action, _ in bridge.calls) == 1
+    assert sum(action == "subscription_finalize" for action, _ in bridge.calls) == 1
 
 
 async def test_simultaneous_close_callers_share_acknowledgement() -> None:
