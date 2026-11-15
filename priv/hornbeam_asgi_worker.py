@@ -24,6 +24,8 @@ import asyncio
 from collections.abc import Callable
 from urllib.parse import unquote
 
+from hornbeam_lifespan_runner import get_state
+
 try:
     import erlang
     from erlang import ByteChannel, ByteChannelClosed
@@ -311,9 +313,9 @@ async def handle_asgi(caller_pid, app_module: str, app_callable: str,
     scope['root_path'] = unquote(scope['root_path'])
     scope.setdefault('extensions', {})['hornbeam.owner'] = caller_pid
 
-    # Use cached state proxy (shared per mount_id)
-    mount_id = scope.get('mount_id')
-    scope['state'] = _get_state_proxy(mount_id)
+    # ASGI requires a fresh shallow copy per request. Keep Python resources
+    # local: request state is not ETS application data or an FFI payload.
+    scope['state'] = get_state(scope.get('mount_id')).copy()
 
     # Create body receiver (handles body mode detection)
     body_receiver = BodyReceiver(req_body_ref)
@@ -331,10 +333,6 @@ import sys
 
 # Cache apps by (module, callable) key - modules already imported by Erlang
 _app_cache: dict = {}
-
-# Cache state proxies by mount_id - shared across requests for same mount
-_state_cache: dict = {}
-
 
 def _get_app(module_name: str, callable_name: str) -> Callable:
     """Get ASGI application from cache or sys.modules.
@@ -363,113 +361,3 @@ def preload_app(app_module: str, app_callable: str) -> bytes:
     """Preload ASGI application at startup."""
     _get_app(app_module, app_callable)
     return b'ok'
-
-
-def _get_state_proxy(mount_id):
-    """Get cached state proxy for mount_id, creating if needed."""
-    if mount_id is None:
-        return _LazyStateProxy(None)
-    proxy = _state_cache.get(mount_id)
-    if proxy is None:
-        proxy = _LazyStateProxy(mount_id)
-        _state_cache[mount_id] = proxy
-    return proxy
-
-
-class _LazyStateProxy(dict):
-    """Dict that lazily fetches from ETS and syncs mutations via callback.
-
-    Optimizations:
-    - No erlang.whereis() on construction (callbacks are pre-registered)
-    - Lazy loading: state only fetched when accessed
-    - Direct ETS access via callbacks (no message passing for reads)
-    """
-
-    __slots__ = ('_mount_id', '_loaded')
-
-    def __init__(self, mount_id=None):
-        super().__init__()
-        self._mount_id = mount_id
-        self._loaded = False
-
-    def _ensure_loaded(self):
-        """Load full state on first access if needed."""
-        if self._loaded:
-            return
-        if not HAS_ERLANG:
-            self._loaded = True
-            return
-        try:
-            if self._mount_id is not None:
-                state = erlang.call('lifespan_state_get', self._mount_id, None)
-            else:
-                state = erlang.call('lifespan_state_get')
-            if state and isinstance(state, dict):
-                super().update(state)
-        except Exception:
-            pass
-        self._loaded = True
-
-    def __getitem__(self, key):
-        # Fast path: check local cache first
-        try:
-            return super().__getitem__(key)
-        except KeyError:
-            pass
-        # Fetch specific key from ETS
-        if HAS_ERLANG:
-            try:
-                if self._mount_id is not None:
-                    value = erlang.call('lifespan_state_get', self._mount_id, key)
-                else:
-                    value = erlang.call('lifespan_state_get', key)
-                if value is not None:
-                    super().__setitem__(key, value)
-                    return value
-            except Exception:
-                pass
-        raise KeyError(key)
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        # Sync to ETS via callback (no whereis needed)
-        if HAS_ERLANG:
-            try:
-                if self._mount_id is not None:
-                    erlang.call('lifespan_state_set', self._mount_id, key, value)
-                else:
-                    erlang.call('lifespan_state_set', key, value)
-            except Exception:
-                pass
-
-    def __contains__(self, key):
-        if super().__contains__(key):
-            return True
-        self._ensure_loaded()
-        return super().__contains__(key)
-
-    def keys(self):
-        self._ensure_loaded()
-        return super().keys()
-
-    def values(self):
-        self._ensure_loaded()
-        return super().values()
-
-    def items(self):
-        self._ensure_loaded()
-        return super().items()
-
-    def get(self, key, default=None):
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def __iter__(self):
-        self._ensure_loaded()
-        return super().__iter__()
-
-    def __len__(self):
-        self._ensure_loaded()
-        return super().__len__()

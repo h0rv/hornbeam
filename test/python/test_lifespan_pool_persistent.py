@@ -53,8 +53,8 @@ class PersistentLifespanTests(unittest.IsolatedAsyncioTestCase):
         path = Path(__file__).resolve().parents[2] / 'priv/hornbeam_lifespan_runner.py'
         spec = importlib.util.spec_from_file_location('lifespan_pool_under_test', path)
         self.runner = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {'erlang': self.bridge}):
-            spec.loader.exec_module(self.runner)
+        self.enterContext(patch.dict(sys.modules, {'erlang': self.bridge}))
+        spec.loader.exec_module(self.runner)
         self.controls = []
         self.tasks = []
         self.patches = []
@@ -139,6 +139,7 @@ class PersistentLifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cleaned.is_set())
         await task
         self.assertEqual(channel.native_calls, [True, True])
+        self.assertEqual(self.runner.get_state(), {})
 
     async def test_explicit_startup_failure_not_lost_on_immediate_exit(self):
         async def app(scope, receive, send):

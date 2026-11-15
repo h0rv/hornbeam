@@ -17,8 +17,9 @@
 The Erlang manager owns the control channel and the submitted coroutine. No
 private loop is created or paused. Applications sharing loop-bound resources
 with requests require erlang_python.event_loop_pool_size=1 for the MVP.
-The cached state result remains a bridge-converted map, not a resource handle
-transport or a guarantee of object identity in request scopes.
+Request scopes shallow-copy the retained Python state in the shared interpreter,
+preserving resource identity. The startup report also supplies a bridge-converted
+snapshot to the Erlang manager; it is not the source for request state.
 """
 
 import asyncio
@@ -28,8 +29,6 @@ import os
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Protocol
-
-import erlang
 
 Message = dict[str, object]
 Receive = Callable[[], Awaitable[Message]]
@@ -116,6 +115,8 @@ async def run_lifespan(
     Protocol responses go directly to the manager. The native input channel also
     lets an Erlang timeout interrupt an application that is not in receive().
     """
+    import erlang
+
     channel = erlang.Channel(channel_ref)
     task: asyncio.Task[None] | None = None
     control: asyncio.Task[object] | None = None
@@ -219,7 +220,10 @@ async def run_lifespan(
                 if task is not None and not task.done() and task not in _unfinished_tasks:
                     await _cancel_task(task)
             finally:
-                if mount_id is not None and _lifespan_states.get(mount_id) is state:
+                if mount_id is None:
+                    if _lifespan_state is state:
+                        clear_state()
+                elif _lifespan_states.get(mount_id) is state:
                     _lifespan_states.pop(mount_id, None)
 
 
@@ -229,7 +233,7 @@ def _replace_state(state: Message) -> None:
 
 
 def get_state(mount_id: str | None = None) -> Message:
-    """Return the existing mutable Python state contract."""
+    """Return this lifespan's Python state; request handlers must shallow-copy it."""
     if mount_id is None:
         return _lifespan_state
     return _lifespan_states.get(mount_id, {})
