@@ -1,0 +1,5 @@
+-module(py_nif).
+-export([submit_task/7]).
+submit_task(_, _, _, _, _, [Owner, _, _, Scope, _, _, Relay], _) ->
+    persistent_term:get(ws_output_observer) ! {submitted, Owner, Relay, Scope},
+    ok.

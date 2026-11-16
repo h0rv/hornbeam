@@ -1,0 +1,3 @@
+-module(py_event_loop_pool).
+-export([get_loop/0]).
+get_loop() -> {ok, loop_double}.
