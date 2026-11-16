@@ -87,7 +87,7 @@ async def handle_lifespan(scope, receive, send):
                 scope["state"]["db_connection"] = "simulated_connection"
                 scope["state"]["cache"] = {}
                 scope["state"]["request_count"] = 0
-                # Store startup tracking in scope state (passed via Erlang ETS)
+                # Requests shallow-copy this Python state, retaining resources.
                 scope["state"]["startup_called"] = True
                 scope["state"]["startup_complete"] = True
 
@@ -227,7 +227,7 @@ async def handle_lifespan_info(scope, receive, send):
 
 
 async def handle_counter(scope, receive, send):
-    """Increment and return a counter (tests state persistence)."""
+    """Contrast request-local assignments with a shared nested resource."""
     await drain_body(receive)
 
     _lifespan_state["request_count"] += 1
@@ -239,8 +239,12 @@ async def handle_counter(scope, receive, send):
         scope["state"]["request_count"] = scope["state"].get("request_count", 0) + 1
         counter_value = scope["state"]["request_count"]
 
+    shared = scope.get("state", {}).get("cache", {})
+    shared["counter"] = shared.get("counter", 0) + 1
+
     body = json.dumps({
         "counter": counter_value,
+        "shared_counter": shared["counter"],
         "source": "scope_state" if "state" in scope else "module_state",
     }).encode("utf-8")
 

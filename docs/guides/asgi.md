@@ -123,6 +123,58 @@ app = Starlette(routes=[
 
 ## Lifespan Protocol
 
+The lifespan application runs continuously on the event-loop pool from startup
+through shutdown; it does not leave its resources on a paused private loop.
+Application shutdown begins in `prep_stop/1`, while the runtime's supervisor
+children are still alive. Cancellation has a bounded grace period; applications
+that suppress cancellation are retained and logged rather than awaited forever.
+
+### State and loop affinity
+
+HTTP request `scope['state']` is a shallow copy of the retained Python lifespan
+state. Nested objects retain identity; top-level assignments/deletions are local
+to that request. This replaces the previous ETS-backed write-through proxy.
+Code that used request dictionary assignment as a shared counter must instead
+use an explicit shared mutable resource or the Erlang state callbacks.
+
+The Erlang `hornbeam_lifespan:get_state`/`set_state`/`update_state` callbacks still
+operate on bridge-converted snapshots. They neither return live Python resources
+nor mutate the Python dictionary used for new request scopes. The snapshot versus
+live-state contract is an upstream API compatibility decision for this proposal.
+
+Loop-bound resources such as async client pools require
+`application:set_env(erlang_python, event_loop_pool_size, 1)` before the runtime
+starts: request PID affinity alone does not select the lifespan loop. This
+implementation also requires `Channel.async_receive(native_only=True)`, absent
+from the pinned `erlang_python` 5.0.0. Resolve and pin that dependency before
+enabling this proposal; increasing the loop pool is not supported for loop-bound
+lifespan resources yet.
+
+### Focused verification
+
+```sh
+python -m pip install pytest
+PYTHONPATH=priv python -m pytest -q test/python
+# Requires the native-only-capable bridge and one event-loop pool member:
+rebar3 ct --suite test/hornbeam_lifespan_SUITE.erl
+```
+
+The Python tests use channel doubles and cover startup/failed startup, shutdown,
+timeouts, cancellation-resistant tasks, per-mount isolation, resource identity,
+and request-local state. The Common Test suite exercises real network requests;
+its counters distinguish local dictionary assignments from shared nested state.
+
+For manual reproduction from an explicit build directory, the ASGI launcher
+selects one event-loop pool member before the runtime starts:
+
+```sh
+escript examples/run_asgi.escript _build/default myapp:application 127.0.0.1:8000 on .
+```
+
+Arguments are the rebar build directory, application, bind address, lifespan mode
+(`on`, `off`, or `auto`), and optional Python import directories. The launcher
+prints the URL after startup succeeds and waits until interrupted.
+
 Handle application startup and shutdown:
 
 ```python

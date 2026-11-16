@@ -51,13 +51,13 @@
 %% State sharing tests
 -export([
     test_state_endpoint/1,
-    test_request_count_increments/1
+    test_request_state_is_local/1
 ]).
 
 %% Counter tests
 -export([
     test_counter_endpoint/1,
-    test_counter_increments_multiple_times/1
+    test_nested_resource_is_shared/1
 ]).
 
 %% Basic endpoint tests
@@ -86,11 +86,11 @@ groups() ->
     ]},
     {state_sharing, [sequence], [
         test_state_endpoint,
-        test_request_count_increments
+        test_request_state_is_local
     ]},
     {counter, [sequence], [
         test_counter_endpoint,
-        test_counter_increments_multiple_times
+        test_nested_resource_is_shared
     ]},
     {basic_endpoints, [sequence], [
         test_root_endpoint,
@@ -98,6 +98,8 @@ groups() ->
     ]}].
 
 init_per_suite(Config) ->
+    application:load(erlang_python),
+    application:set_env(erlang_python, event_loop_pool_size, 1),
     {ok, _} = application:ensure_all_started(hornbeam),
     {ok, _} = application:ensure_all_started(livery),
     Config.
@@ -233,8 +235,8 @@ test_state_endpoint(Config) ->
 
     ?assert(maps:is_key(<<"module_state">>, State)).
 
-test_request_count_increments(Config) ->
-    %% Test request count increments across requests
+test_request_state_is_local(Config) ->
+    %% ASGI requires shallow copies: top-level assignments are request-local.
     Url = make_url(Config, <<"/counter">>),
 
     %% Make first request
@@ -247,8 +249,8 @@ test_request_count_increments(Config) ->
     Counter2 = jsx:decode(Body2, [return_maps]),
     Count2 = maps:get(<<"counter">>, Counter2),
 
-    %% Counter should have incremented
-    ?assert(Count2 > Count1).
+    ?assertEqual(1, Count1),
+    ?assertEqual(1, Count2).
 
 %%% ============================================================================
 %%% Counter tests
@@ -263,14 +265,14 @@ test_counter_endpoint(Config) ->
     ?assert(maps:is_key(<<"counter">>, Counter)),
     ?assert(maps:is_key(<<"source">>, Counter)).
 
-test_counter_increments_multiple_times(Config) ->
-    %% Test counter increments across multiple requests
+test_nested_resource_is_shared(Config) ->
+    %% Shallow copying keeps the identity of a mutable lifespan resource.
     Url = make_url(Config, <<"/counter">>),
 
     Counts = lists:map(fun(_) ->
         {ok, #{status := 200, body := {full, Body}}} = hornbeam_test_http:request(get, Url, #{}),
         Counter = jsx:decode(Body, [return_maps]),
-        maps:get(<<"counter">>, Counter)
+        maps:get(<<"shared_counter">>, Counter)
     end, lists:seq(1, 5)),
 
     %% Each count should be greater than the previous
