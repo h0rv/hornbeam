@@ -74,6 +74,12 @@ class ContinuousWebSocketPatchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.output: asyncio.Queue[tuple[object, object]] = asyncio.Queue()
         _bridge.__dict__["send"] = lambda owner, message: self.output.put_nowait((owner, message))
+        async def async_call(name: str, transport_owner: object, owner: object, message: object) -> int:
+            self.assertEqual(name, "hornbeam_ws_output")
+            if message != b"abort":
+                self.output.put_nowait((owner, message))
+            return 1
+        _bridge.__dict__["async_call"] = async_call
         self.tasks: list[asyncio.Task[bytes]] = []
         self.modules: list[str] = []
 

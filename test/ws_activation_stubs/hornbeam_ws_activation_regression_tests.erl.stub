@@ -1,5 +1,5 @@
 %% Real ws_session state machine/codec with transport and native task doubles.
-%% Run in a fresh VM: test/ws_activation_stubs must not shadow a live runtime.
+%% Run via test/ws_activation_stubs/run.sh, never in a native-runtime VM.
 -module(hornbeam_ws_activation_regression_tests).
 -include_lib("eunit/include/eunit.hrl").
 -export([send/2, send/3, abort/1, activate/1, close/1, classify/2, controlling_process/2]).

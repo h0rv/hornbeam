@@ -8,6 +8,56 @@ order: 12
 
 Hornbeam provides full WebSocket support via ASGI, enabling real-time bidirectional communication for chat apps, live updates, multiplayer games, and more.
 
+## Continuous application execution
+
+Each ASGI WebSocket application runs once for the connection lifetime. An app may
+send immediately after acceptance or push while no inbound frame is pending.
+Input arrives over a bounded native channel; output goes through an acknowledged
+transport relay instead of a fire-and-forget process mailbox. The send callback
+waits for transport progress, with a five-second output deadline. Overlarge
+frames, full input buffers, stalled output, or owner death close the session and
+release the input channel. The default maximum frame payload is 16 MiB.
+
+`scope['extensions']['hornbeam.owner']` is the owning Erlang session PID, not an
+ASGI standard extension. ASGI remains the default protocol; applications that
+consume raw native channels must opt into `websocket_protocol => channels`.
+Arbitrary five-item JSON arrays are application messages, not mode switches.
+
+### Dependency requirements
+
+This implementation is not compatible with the currently pinned dependencies:
+
+- `erlang_python` 5.0.0 lacks `Channel.async_receive(native_only=True)`.
+- Livery 0.9.2 resolves `erlang_ws` 0.5.0, whose `ws_session` lacks
+  `send_sync/3` and `abort/1`. Compilation does not detect these remote calls;
+  the first output fails at runtime with `undef`. These APIs must acknowledge
+  actual transport completion, work before activation, enter the closing state
+  correctly, and abort blocked output with bounded transport cleanup.
+
+Do not replace these operations with asynchronous `ws_session:send/2`: doing so
+would lose backpressure and the output-acknowledgment contract. Both dependencies
+need accepted APIs and explicit version pins before this feature can be submitted
+upstream. The current branch preserves those gates instead of inventing a second
+transport implementation inside Hornbeam.
+
+### Focused verification
+
+```sh
+python -m pip install pytest
+PYTHONPATH=priv python -m pytest -q test/python
+# Require ws_session:send_sync/3 and ws_session:abort/1:
+sh test/ws_activation_stubs/run.sh
+sh test/ws_output_flow_stubs/run.sh
+# Also requires the patched native bridge:
+rebar3 ct --suite test/hornbeam_ws_continuous_patch_SUITE.erl
+```
+
+Python tests double the embedding callback boundary. The Erlang runners use real
+ws sessions/codecs but isolate native task/channel doubles in fresh VMs; they
+must not be loaded into a native-runtime VM. With `erlang_ws` 0.5.0 these focused
+Erlang checks fail on the missing APIs; they are prerequisites, not passing native
+evidence. The native network suite remains gated on both dependency changes.
+
 ## Basic WebSocket Handler
 
 ```python
