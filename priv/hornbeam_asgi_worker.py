@@ -286,6 +286,8 @@ async def handle_asgi(caller_pid, app_module: str, app_callable: str,
     # Get app (cached)
     app = _get_app(app_module, app_callable)
 
+    scope.setdefault('extensions', {})['hornbeam.owner'] = caller_pid
+
     # Use cached state proxy (shared per mount_id)
     mount_id = scope.get('mount_id')
     scope['state'] = _get_state_proxy(mount_id)
