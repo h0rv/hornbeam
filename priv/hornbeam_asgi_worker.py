@@ -24,7 +24,6 @@ import asyncio
 from collections.abc import Callable
 from urllib.parse import unquote
 
-
 try:
     import erlang
     from erlang import ByteChannel, ByteChannelClosed
@@ -334,6 +333,7 @@ _app_cache: dict = {}
 
 # Cache state proxies by mount_id - shared across requests for same mount
 _state_cache: dict = {}
+
 
 def _get_app(module_name: str, callable_name: str) -> Callable:
     """Get ASGI application from cache or sys.modules.
