@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import asyncio
+import os
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -742,35 +745,47 @@ class UpstreamNative(TestDoubleBridge):
         super().__init__()
         self.closure = "wait"
         self.wait_result: tuple[str, object] = ("error", "closed")
+        self.ready = False
+        self.closed_error: type[Exception] = TestDoubleChannelClosed
 
-    def _channel_try_receive(self, resource: object) -> None:
-        if self.closure == "try":
-            raise RuntimeError("channel closed")
+    def _channel_term_result(self, resource: object) -> tuple[bool, object]:
+        if self.wait_result[0] == "ok":
+            return False, self.wait_result[1]
+        if self.closure == "try" or self.ready:
+            raise self.closed_error("channel closed")
+        return True, None
 
-    def _channel_is_closed(self, resource: object) -> bool:
-        return self.closure == "closed"
-
-    def _channel_wait(self, resource: object, callback_id: int, capsule: object) -> object:
-        return self.wait_result
+    def _channel_ready(self, *args: object) -> bool:
+        self.ready = True
+        return True
 
 
 @pytest.fixture
-def upstream_native(monkeypatch: pytest.MonkeyPatch) -> UpstreamNative:
-    source = Path(__file__).resolve().parents[3] / "erlang-python/priv/_erlang_impl/_channel.py"
+async def upstream_native(monkeypatch: pytest.MonkeyPatch) -> UpstreamNative:
+    dependency = os.environ.get("ERLANG_PYTHON_SOURCE")
+    if not dependency:
+        pytest.skip("set ERLANG_PYTHON_SOURCE to the native_only-capable dependency checkout")
+    source = Path(dependency) / "priv/_erlang_impl/_channel.py"
     spec = spec_from_file_location("erlang", source)
     assert spec is not None and spec.loader is not None
     module = module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "erlang", module)
     spec.loader.exec_module(module)
     native = UpstreamNative()
+    native.closed_error = module.ChannelClosed
+    # Run the dependency's Python wrapper, with its native loop/NIF boundary
+    # explicitly doubled. This is contract coverage, not a native-runtime test.
+    loop_module = ModuleType("_erlang_impl._loop")
+    loop_module.ErlangEventLoop = type(asyncio.get_running_loop())
+    monkeypatch.setitem(sys.modules, "_erlang_impl._loop", loop_module)
     monkeypatch.setattr(module, "async_call", native.async_call, raising=False)
-    monkeypatch.setattr(module, "_channel_try_receive", native._channel_try_receive, raising=False)
-    monkeypatch.setattr(module, "_channel_is_closed", native._channel_is_closed, raising=False)
-    monkeypatch.setattr(module, "_channel_wait", native._channel_wait, raising=False)
+    monkeypatch.setattr(module, "_channel_term_result", native._channel_term_result, raising=False)
+    monkeypatch.setattr(module, "_channel_ready", native._channel_ready, raising=False)
+    monkeypatch.setattr(module, "_channel_cancel_ready", lambda *args: True, raising=False)
     return native
 
 
-@pytest.mark.parametrize("closure", ["try", "closed", "wait"])
+@pytest.mark.parametrize("closure", ["try", "wait"])
 @pytest.mark.parametrize("iterate", [False, True])
 @pytest.mark.parametrize(
     ("terminal", "expected"),

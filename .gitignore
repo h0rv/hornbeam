@@ -14,6 +14,7 @@ rebar.lock
 
 # Python
 __pycache__/
+.hypothesis/
 *.pyc
 *.pyo
 venv/

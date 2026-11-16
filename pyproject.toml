@@ -4,6 +4,12 @@ version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest>=8.4,<9", "pytest-asyncio>=1.2,<2", "hypothesis>=6.140,<7"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [build-system]
 requires = ["uv_build>=0.9,<1"]
 build-backend = "uv_build"

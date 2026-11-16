@@ -31,6 +31,9 @@ hornbeam:start("app:application", #{worker_class => asgi}).
 
 ## ASGI Scope
 
+The additive [typed services API](services.md) uses the nonstandard
+`extensions['hornbeam.owner']` request PID for request-owned subscriptions.
+
 The scope dict contains request information:
 
 ### HTTP Scope
