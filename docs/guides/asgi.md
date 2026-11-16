@@ -43,11 +43,20 @@ The scope dict contains request information:
 | `method` | str | HTTP method |
 | `scheme` | str | `"http"` or `"https"` |
 | `path` | str | URL path (stripped of mount prefix in [multi-app mode](/docs/guides/multi-app)) |
+| `raw_path` | bytes | Original percent-encoded path, including the mount prefix |
 | `query_string` | bytes | Query string |
 | `root_path` | str | ASGI root path (set to mount prefix in [multi-app mode](/docs/guides/multi-app)) |
 | `headers` | list | `[[name, value], ...]` |
 | `server` | tuple | `(host, port)` |
 | `client` | tuple | `(host, port)` or None |
+
+`path` and `root_path` are percent-decoded Unicode. `raw_path`, `query_string`,
+header names/values, and request bodies remain bytes even when they contain valid
+UTF-8. Duplicate headers retain their order.
+
+The final `http.request` event has `more_body=False`. Subsequent `receive()` calls
+wait for disconnect rather than returning EOF repeatedly; EOF alone is not a
+client disconnect. Concurrent pending receive calls are not supported.
 
 ### WebSocket Scope
 
