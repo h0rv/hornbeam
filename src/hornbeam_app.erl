@@ -17,11 +17,14 @@
 
 -behaviour(application).
 
--export([start/2, stop/1]).
+-export([start/2, prep_stop/1, stop/1]).
 
 start(_StartType, _StartArgs) ->
     hornbeam_sup:start_link().
 
-stop(_State) ->
+prep_stop(State) ->
     hornbeam:stop(),
+    State.
+
+stop(_State) ->
     ok.

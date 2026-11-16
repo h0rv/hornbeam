@@ -30,6 +30,8 @@
     start_link/0,
     subscribe/1,
     subscribe/2,
+    subscribe_managed/2,
+    is_managed/1,
     unsubscribe/1,
     unsubscribe/2,
     publish/2,
@@ -48,6 +50,7 @@
 
 -define(SERVER, ?MODULE).
 -define(SCOPE, hornbeam_pubsub_scope).
+-define(MANAGED_GROUP, {?MODULE, managed_guardians}).
 
 %%% ============================================================================
 %%% API
@@ -68,6 +71,16 @@ subscribe(Topic, Pid) ->
     pg:join(?SCOPE, Topic, Pid),
     ok.
 
+%% Mark before exposing topic membership. The marker is owned by pg, not
+%% the service ETS owner, and is removed only when the guardian dies. Even
+%% after unsubscribe/reset, stale publisher snapshots must fail closed.
+subscribe_managed(Topic, Pid) ->
+    ok = pg:join(?SCOPE, ?MANAGED_GROUP, Pid),
+    subscribe(Topic, Pid).
+
+is_managed(Pid) ->
+    lists:member(Pid, pg:get_members(?SCOPE, ?MANAGED_GROUP)).
+
 %% @doc Unsubscribe the calling process from a topic.
 -spec unsubscribe(Topic :: term()) -> ok.
 unsubscribe(Topic) ->
@@ -85,7 +98,10 @@ unsubscribe(Topic, Pid) ->
 publish(Topic, Message) ->
     Members = pg:get_members(?SCOPE, Topic),
     lists:foreach(fun(Pid) ->
-        Pid ! {pubsub, Topic, Message}
+        case hornbeam_services:managed_delivery(Pid, Topic, Message) of
+            managed -> ok;
+            unmanaged -> Pid ! {pubsub, Topic, Message}
+        end
     end, Members),
     length(Members).
 

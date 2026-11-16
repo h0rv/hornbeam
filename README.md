@@ -12,7 +12,7 @@ The name combines "horn" (unicorn, like gunicorn) with "BEAM" (Erlang VM).
 - **WSGI Support**: Run standard WSGI Python applications
 - **ASGI Support**: Run async ASGI Python applications (FastAPI, Starlette, etc.)
 - **WebSocket**: Full WebSocket support for real-time apps
-- **HTTP/2**: Via Cowboy, with multiplexing and server push
+- **HTTP via livery**: HTTP/1.1 today; HTTP/2 and HTTP/3 listeners land with upcoming livery releases
 - **Shared State**: ETS-backed state accessible from Python (concurrent-safe)
 - **Distributed RPC**: Call functions on remote Erlang nodes
 - **Pub/Sub**: pg-based publish/subscribe messaging
@@ -31,8 +31,8 @@ hornbeam:start("main:app", #{worker_class => asgi}).
 
 %% With all options
 hornbeam:start("myapp:application", #{
-    bind => "0.0.0.0:8000",
-    workers => 4,
+    bind => <<"0.0.0.0:8642">>,
+    num_contexts => 4,
     worker_class => asgi,
     lifespan => auto
 }).
@@ -220,20 +220,22 @@ rebar3 shell
 ```erlang
 hornbeam:start("myapp:application", #{
     %% Server
-    bind => <<"0.0.0.0:8000">>,
+    bind => <<"0.0.0.0:8642">>,
     ssl => false,
     certfile => undefined,
     keyfile => undefined,
 
     %% Protocol
     worker_class => wsgi,  % wsgi | asgi
-    http_version => ['HTTP/1.1', 'HTTP/2'],
+    %% 'HTTP/2' and 'HTTP/3' require ssl => true
+    http_version => ['HTTP/1.1'],
 
-    %% Workers
-    workers => 4,
+    %% Python contexts
+    num_contexts => 4,      % defaults to the scheduler count
+    num_acceptors => 100,
+    max_concurrent => 10000,
     timeout => 30000,
     keepalive => 2,
-    max_requests => 1000,
 
     %% ASGI
     lifespan => auto,  % auto | on | off
@@ -250,13 +252,14 @@ hornbeam:start("myapp:application", #{
 ### Via sys.config
 
 ```erlang
+%% Every option defaults in hornbeam_config:defaults/0; set a key here
+%% only to override one.
 [
     {hornbeam, [
-        {bind, "127.0.0.1:8000"},
-        {workers, 4},
+        {bind, <<"127.0.0.1:8642">>},
         {worker_class, wsgi},
         {timeout, 30000},
-        {pythonpath, ["."]}
+        {pythonpath, [<<".">>]}
     ]}
 ].
 ```

@@ -41,13 +41,8 @@ cd my_app
     {vm_args, "config/vm.args"}
 ]}.
 
-{profiles, [
-    {test, [
-        {deps, [
-            {hackney, "3.0.2"}
-        ]}
-    ]}
-]}.
+%% livery (already a hornbeam dependency) provides the HTTP client
+%% used in the test suite below; no extra test dependency needed.
 ```
 
 ### Project Structure
@@ -87,7 +82,7 @@ my_app/
         hornbeam
     ]},
     {env, [
-        {http_port, 8000},
+        {http_port, 8642},
         {python_app, "app:application"},
         {worker_class, wsgi}
     ]},
@@ -292,7 +287,7 @@ init_hooks() ->
 %% config/sys.config
 [
     {my_app, [
-        {http_port, 8000},
+        {http_port, 8642},
         {python_app, "app:application"},
         {worker_class, asgi},
         {api_key, "${API_KEY}"},
@@ -469,7 +464,7 @@ COPY --from=builder /app/_build/prod/rel/my_app /app
 COPY priv/python/requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 WORKDIR /app
-EXPOSE 8000
+EXPOSE 8642
 CMD ["bin/my_app", "foreground"]
 ```
 
@@ -519,18 +514,18 @@ def get_from_remote(key):
 all() -> [test_api].
 
 init_per_suite(Config) ->
-    {ok, _} = application:ensure_all_started(hackney),
     {ok, _} = application:ensure_all_started(my_app),
     Config.
 
 end_per_suite(_Config) ->
     application:stop(my_app),
-    application:stop(hackney),
     ok.
 
 test_api(_Config) ->
-    {ok, 200, _Headers, ClientRef} = hackney:request(get, <<"http://localhost:8000/">>, [], <<>>, []),
-    {ok, Body} = hackney:body(ClientRef),
+    Client = livery_client:new(#{}),
+    {ok, Resp} = livery_client:get(Client, <<"http://localhost:8642/">>),
+    200 = livery_client:status(Resp),
+    {full, Body} = livery_client:body(Resp),
     true = is_binary(Body),
     ok.
 ```

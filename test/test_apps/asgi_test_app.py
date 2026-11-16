@@ -130,14 +130,14 @@ async def handle_info(scope, receive, send):
         'asgi': scope.get('asgi', {}),
     }
 
-    # Include headers as list of [name, value] pairs (matching ASGI spec)
-    headers = []
+    # Include headers
+    headers = {}
     for name, value in scope.get('headers', []):
         if isinstance(name, bytes):
             name = name.decode()
         if isinstance(value, bytes):
             value = value.decode()
-        headers.append([name, value])
+        headers[name] = value
     info['headers'] = headers
 
     body = json.dumps(info, indent=2).encode('utf-8')
@@ -162,18 +162,14 @@ async def handle_scope(scope, receive, send):
     for key, value in scope.items():
         if isinstance(value, bytes):
             scope_data[key] = value.decode('utf-8', errors='replace')
-        elif isinstance(value, (list, tuple)) or (hasattr(value, '__iter__') and not isinstance(value, (str, dict))):
-            # Handle list, tuple, and iterable types like LazyHeaderList
-            converted = []
-            for item in value:
-                if isinstance(item, (list, tuple)) and len(item) == 2:
-                    converted.append([
-                        item[0].decode('utf-8', errors='replace') if isinstance(item[0], bytes) else item[0],
-                        item[1].decode('utf-8', errors='replace') if isinstance(item[1], bytes) else item[1]
-                    ])
-                else:
-                    converted.append(str(item))
-            scope_data[key] = converted
+        elif isinstance(value, (list, tuple)):
+            scope_data[key] = [
+                [
+                    item[0].decode('utf-8', errors='replace') if isinstance(item[0], bytes) else item[0],
+                    item[1].decode('utf-8', errors='replace') if isinstance(item[1], bytes) else item[1]
+                ] if isinstance(item, (list, tuple)) and len(item) == 2 else str(item)
+                for item in value
+            ]
         else:
             try:
                 json.dumps(value)
@@ -498,9 +494,11 @@ async def handle_unicode(scope, receive, send):
 
 async def handle_early_hints(scope, receive, send):
     """Test 103 Early Hints response."""
-    # Send 103 Early Hints (informational response)
+    # Send 103 Early Hints ahead of the final response. Interim
+    # responses go through http.response.informational, not
+    # http.response.start, which is reserved for the final head.
     await send({
-        'type': 'http.response.start',
+        'type': 'http.response.informational',
         'status': 103,
         'headers': [
             [b'link', b'</style.css>; rel=preload; as=style'],

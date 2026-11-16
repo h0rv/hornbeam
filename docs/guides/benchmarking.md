@@ -222,22 +222,22 @@ rebar3 shell
 
 # In Erlang shell:
 hornbeam:start("myapp:application", #{
-    bind => <<"127.0.0.1:8000">>,
+    bind => <<"127.0.0.1:8642">>,
     worker_class => wsgi
 }).
 
 # In another terminal, run wrk:
-wrk -t4 -c100 -d30s --latency http://127.0.0.1:8000/
+wrk -t4 -c100 -d30s --latency http://127.0.0.1:8642/
 ```
 
 ### Using Apache Bench (ab)
 
 ```bash
 # Simple benchmark
-ab -n 10000 -c 100 -k http://127.0.0.1:8000/
+ab -n 10000 -c 100 -k http://127.0.0.1:8642/
 
 # High concurrency
-ab -n 5000 -c 500 -k http://127.0.0.1:8000/
+ab -n 5000 -c 500 -k http://127.0.0.1:8642/
 ```
 
 ### Key wrk Flags
@@ -283,11 +283,12 @@ hornbeam:start("app:application", #{
 
 ### HTTP/2 for Lower Latency
 
-Enable HTTP/2 for multiplexed connections:
+Enable HTTP/2 for multiplexed connections. Listing HTTP/1.1 alongside it
+serves both from the one TLS port, chosen per connection by ALPN:
 
 ```erlang
 hornbeam:start("app:application", #{
-    http_version => ['HTTP/2', 'HTTP/1.1'],
+    http_version => ['HTTP/1.1', 'HTTP/2'],
     ssl => true,
     certfile => "server.crt",
     keyfile => "server.key"
@@ -322,8 +323,8 @@ The simple "Hello World" benchmarks measure raw server overhead. For realistic n
 hornbeam:start("myapp:app", #{...}).
 
 # Benchmark specific endpoints
-wrk -t4 -c100 -d30s http://localhost:8000/api/users
-wrk -t4 -c100 -d30s http://localhost:8000/api/search?q=test
+wrk -t4 -c100 -d30s http://localhost:8642/api/users
+wrk -t4 -c100 -d30s http://localhost:8642/api/search?q=test
 ```
 
 Consider:

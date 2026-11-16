@@ -15,7 +15,6 @@
 %%% @doc Hornbeam top-level supervisor.
 %%%
 %%% Supervises all hornbeam services:
-%%% - hornbeam_profiler: Request profiling for performance analysis
 %%% - hornbeam_mounts: Multi-app mount registry
 %%% - hornbeam_config: Configuration management
 %%% - hornbeam_state: Shared state ETS
@@ -23,6 +22,7 @@
 %%% - hornbeam_callbacks: Erlang callback registry
 %%% - hornbeam_pubsub: Pub/sub messaging
 %%% - hornbeam_lifespan: ASGI lifespan management
+%%% - hornbeam_context_pool: Python context pool
 %%% - hornbeam_hooks: Hooks-style execution API
 %%% - hornbeam_channel_registry: Channel topic pattern matching
 %%% - hornbeam_presence: Distributed presence tracking (CRDT)
@@ -47,12 +47,12 @@ init([]) ->
 
     Children = [
         #{
-            id => hornbeam_profiler,
-            start => {hornbeam_profiler, start_link, []},
+            id => hornbeam_listener,
+            start => {hornbeam_listener, start_link, []},
             restart => permanent,
             shutdown => 5000,
             type => worker,
-            modules => [hornbeam_profiler]
+            modules => [hornbeam_listener]
         },
         #{
             id => hornbeam_mounts,
@@ -103,12 +103,28 @@ init([]) ->
             modules => [hornbeam_pubsub]
         },
         #{
+            id => hornbeam_services,
+            start => {hornbeam_services, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [hornbeam_services]
+        },
+        #{
             id => hornbeam_lifespan,
             start => {hornbeam_lifespan, start_link, []},
             restart => permanent,
             shutdown => 10000,
             type => worker,
             modules => [hornbeam_lifespan]
+        },
+        #{
+            id => hornbeam_context_pool,
+            start => {hornbeam_context_pool, start_link, []},
+            restart => permanent,
+            shutdown => 10000,
+            type => worker,
+            modules => [hornbeam_context_pool]
         },
         #{
             id => hornbeam_hooks,

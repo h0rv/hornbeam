@@ -51,9 +51,11 @@
     execute_async/4,
     await_result/2,
     stream/4,
+    stream_ref/4,
     stream_next_ref/1,
     find/1,
-    all/0
+    all/0,
+    clear/0
 ]).
 
 %% Response helpers
@@ -171,10 +173,68 @@ stream(AppPath, Action, Args, Kwargs) when is_binary(AppPath), is_binary(Action)
             stream_python_registered(AppPath, Action, Args, Kwargs)
     end.
 
+%% Generator storage: ETS so callers can drive next/cleanup without
+%% serialising through the hooks gen_server (which itself wants to call
+%% back into Python and would otherwise deadlock with the caller's
+%% context).
+-define(GEN_TABLE, hornbeam_hooks_generators).
+
 %% @doc Call next on a stored generator ref.
 -spec stream_next_ref(GenRef :: reference()) -> {value, term()} | done | {error, term()}.
 stream_next_ref(GenRef) ->
-    gen_server:call(?SERVER, {stream_next_ref, GenRef}, infinity).
+    case ets:lookup(?GEN_TABLE, GenRef) of
+        [{_, GenFun}] ->
+            case GenFun() of
+                done ->
+                    ets:delete(?GEN_TABLE, GenRef),
+                    done;
+                {value, _} = V ->
+                    V;
+                {error, Reason} ->
+                    ets:delete(?GEN_TABLE, GenRef),
+                    {error, Reason}
+            end;
+        [] ->
+            {error, generator_not_found}
+    end.
+
+%% @doc Start a stream and store the generator under an opaque ref so
+%% the Python side (which can't carry an Erlang fun across the bridge)
+%% has something it can hand back to {@link stream_next_ref/1}.
+-spec stream_ref(AppPath :: binary(), Action :: binary(),
+                 Args :: list(), Kwargs :: map()) ->
+    {ok, reference()} | {error, term()}.
+stream_ref(AppPath, Action, Args, Kwargs) ->
+    case stream(AppPath, Action, Args, Kwargs) of
+        {ok, GenFun} when is_function(GenFun, 0) ->
+            ensure_gen_table(),
+            GenRef = make_ref(),
+            ets:insert(?GEN_TABLE, {GenRef, GenFun}),
+            {ok, GenRef};
+        {error, _} = Err ->
+            Err
+    end.
+
+ensure_gen_table() ->
+    case ets:info(?GEN_TABLE) of
+        undefined ->
+            try ets:new(?GEN_TABLE, [named_table, public, set,
+                                     {read_concurrency, true},
+                                     {write_concurrency, true}])
+            catch error:badarg -> ok  % racing creator already won
+            end;
+        _ -> ok
+    end.
+
+%% @doc Unregister every hook.
+%%
+%% Each registration is a persistent_term, so leaving them behind after
+%% `hornbeam:stop/0' means a later run answers with the previous run's
+%% handlers. Goes through the server so it serialises with `reg' and
+%% `unreg' rather than racing them.
+-spec clear() -> ok.
+clear() ->
+    gen_server:call(?SERVER, clear).
 
 %%% ============================================================================
 %%% gen_server callbacks
@@ -184,6 +244,18 @@ init([]) ->
     %% Initialize the hooks list
     persistent_term:put(?HOOKS_LIST, []),
     {ok, #state{}}.
+
+handle_call(clear, _From, State) ->
+    _ = [persistent_term:erase(?HOOK_KEY(AppPath))
+         || AppPath <- persistent_term:get(?HOOKS_LIST, [])],
+    persistent_term:put(?HOOKS_LIST, []),
+    %% The generator table is public and created lazily; empty it rather
+    %% than deleting it, so a concurrent ensure_gen_table/0 stays valid.
+    _ = case ets:info(?GEN_TABLE) of
+        undefined -> ok;
+        _ -> ets:delete_all_objects(?GEN_TABLE)
+    end,
+    {reply, ok, State};
 
 handle_call({reg, AppPath, Handler}, _From, State) ->
     %% Store in persistent_term for fast lookup
@@ -230,20 +302,10 @@ handle_call({await_result, TaskRef, Timeout}, From, #state{tasks = Tasks} = Stat
             {noreply, State#state{tasks = NewTasks}}
     end;
 
-handle_call({stream_next_ref, GenRef}, _From, #state{generators = Gens} = State) ->
-    case maps:get(GenRef, Gens, undefined) of
-        undefined ->
-            {reply, {error, generator_not_found}, State};
-        GenFun ->
-            case GenFun() of
-                done ->
-                    {reply, done, State#state{generators = maps:remove(GenRef, Gens)}};
-                {value, Value} ->
-                    {reply, {value, Value}, State};
-                {error, Reason} ->
-                    {reply, {error, Reason}, State#state{generators = maps:remove(GenRef, Gens)}}
-            end
-    end;
+    %% stream_store / stream_next_ref are handled directly via ETS in
+    %% stream_ref/4 and stream_next_ref/1 (avoids deadlocking the hooks
+    %% gen_server when the generator's body has to call back into
+    %% Python).
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
@@ -316,8 +378,14 @@ execute_python(AppPath, Action, Args, Kwargs) ->
 
 execute_python_registered(AppPath, Action, Args, Kwargs) ->
     try
-        Result = py:call(hornbeam_hooks_runner, execute_registered, [AppPath, Action, Args, Kwargs]),
-        {ok, Result}
+        %% py:call already returns {ok, _} | {error, _}; pass through
+        %% directly so we don't double-wrap the handler's value.
+        case py:call(hornbeam_hooks_runner, execute_registered,
+                     [AppPath, Action, Args, Kwargs]) of
+            {ok, _} = Ok -> Ok;
+            {error, _} = Err -> Err;
+            Other -> {ok, Other}
+        end
     catch
         throw:Reason -> {error, Reason};
         error:Reason -> {error, Reason};

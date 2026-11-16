@@ -15,7 +15,7 @@
 %%% @doc Main API for hornbeam WSGI/ASGI server.
 %%%
 %%% Hornbeam is an Erlang-based WSGI/ASGI server that uses erlang-python
-%%% for Python execution and Cowboy for HTTP handling.
+%%% for Python execution and livery for HTTP handling.
 %%%
 %%% == Quick Start ==
 %%%
@@ -25,8 +25,8 @@
 %%%
 %%% %% Start with options
 %%% hornbeam:start("myapp:application", #{
-%%%     bind => "0.0.0.0:8000",
-%%%     workers => 4
+%%%     bind => <<"0.0.0.0:8642">>,
+%%%     num_contexts => 4
 %%% }).
 %%%
 %%% %% Start ASGI app with lifespan
@@ -38,11 +38,11 @@
 %%% %% Multi-app mode - mount different apps at different prefixes
 %%% hornbeam:start(#{
 %%%     mounts => [
-%%%         {"/api", "api:app", #{worker_class => asgi, workers => 4}},
+%%%         {"/api", "api:app", #{worker_class => asgi, num_contexts => 4}},
 %%%         {"/admin", "admin:app", #{worker_class => wsgi}},
 %%%         {"/", "frontend:app", #{worker_class => wsgi}}
 %%%     ],
-%%%     routes => [{"/health", health_handler, #{}}]  %% optional Erlang handlers
+%%%     routes => [{<<"GET">>, "/health", fun health_handler:handle/1}]  %% optional Erlang handlers
 %%% }).
 %%%
 %%% %% Register Erlang functions callable from Python
@@ -57,6 +57,8 @@
     start/1,
     start/2,
     stop/0,
+    info/0,
+    is_running/0,
     register_function/2,
     register_function/3,
     unregister_function/1
@@ -66,14 +68,14 @@
 -type mount_spec() :: {Prefix :: string() | binary(), AppSpec :: app_spec(), Opts :: map()}.
 -type options() :: #{
     bind => string() | binary(),
-    workers => pos_integer(),
+    num_contexts => pos_integer(),
     num_acceptors => pos_integer(),
     worker_class => wsgi | asgi,
+    http_version => [http_version()],
+    context_mode => worker | owngil,
     timeout => pos_integer(),
     keepalive => pos_integer(),
-    max_requests => pos_integer(),
     max_concurrent => pos_integer(),
-    preload_app => boolean(),
     pythonpath => [string() | binary()],
     venv => string() | binary() | undefined,
     lifespan => auto | on | off,
@@ -81,12 +83,15 @@
     websocket_timeout => pos_integer(),
     websocket_max_frame_size => pos_integer(),
     websocket_compress => boolean(),
-    routes => [{Path :: binary(), Handler :: module(), Opts :: map()}],
+    max_body => non_neg_integer() | infinity,
+    routes => [route()],
     %% SSL/TLS
     ssl => boolean(),
     certfile => string() | binary() | undefined,
     keyfile => string() | binary() | undefined,
     cacertfile => string() | binary() | undefined,
+    %% UDP port for the HTTP/3 listener; defaults to the `bind' port
+    http3_port => inet:port_number(),
     %% HTTP lifecycle hooks
     hooks => #{
         on_request => fun((map()) -> map()),
@@ -94,11 +99,19 @@
         on_error => fun((term(), map()) -> {integer(), binary()})
     }
 }.
+-type route() ::
+    {Method :: binary() | '_', Pattern :: binary() | string(),
+     Handler :: fun((term()) -> term()) | {module(), atom()}} |
+    {Method :: binary() | '_', Pattern :: binary() | string(),
+     Handler :: fun((term()) -> term()) | {module(), atom()}, Meta :: map()}.
+%% `HTTP/2' and `HTTP/3' are TLS-only, so they require `ssl => true'.
+-type http_version() :: 'HTTP/1.1' | 'HTTP/2' | 'HTTP/3'.
 -type multi_app_config() :: #{
     mounts := [mount_spec()],
-    routes => [{Path :: binary(), Handler :: module(), Opts :: map()}],
+    routes => [route()],
     bind => string() | binary(),
     num_acceptors => pos_integer(),
+    http_version => [http_version()],
     pythonpath => [string() | binary()],
     venv => string() | binary() | undefined,
     %% SSL/TLS
@@ -106,6 +119,7 @@
     certfile => string() | binary() | undefined,
     keyfile => string() | binary() | undefined,
     cacertfile => string() | binary() | undefined,
+    http3_port => inet:port_number(),
     %% HTTP lifecycle hooks
     hooks => #{
         on_request => fun((map()) -> map()),
@@ -114,7 +128,8 @@
     }
 }.
 
--export_type([app_spec/0, options/0, mount_spec/0, multi_app_config/0]).
+-export_type([app_spec/0, options/0, mount_spec/0, multi_app_config/0, route/0,
+              http_version/0]).
 
 %% @doc Start hornbeam with a WSGI/ASGI application or multi-app config.
 %%
@@ -132,22 +147,24 @@ start(AppSpec) when is_list(AppSpec); is_binary(AppSpec) ->
 %%
 %% Options:
 %% <ul>
-%%   <li>`bind' - Address to bind to (default: "127.0.0.1:8000")</li>
-%%   <li>`workers' - Number of Python workers (default: 4)</li>
-%%   <li>`num_acceptors' - Number of Cowboy acceptor processes (default: 100)</li>
+%%   <li>`bind' - Address to bind to (default: "127.0.0.1:8642")</li>
+%%   <li>`num_contexts' - Number of Python contexts (default: schedulers)</li>
+%%   <li>`num_acceptors' - Number of HTTP acceptor processes (default: 100)</li>
 %%   <li>`worker_class' - wsgi or asgi (default: wsgi)</li>
+%%   <li>`http_version' - HTTP versions to serve (default: ['HTTP/1.1']).
+%%       `'HTTP/2'' and `'HTTP/3'' are TLS-only and require `ssl => true'.
+%%       `['HTTP/1.1', 'HTTP/2']' serves both from the `bind' port by ALPN;
+%%       `'HTTP/3'' adds a QUIC listener on the same port number over UDP</li>
 %%   <li>`timeout' - Request timeout in ms (default: 30000)</li>
 %%   <li>`keepalive' - Keep-alive timeout in seconds (default: 2)</li>
-%%   <li>`max_requests' - Max requests per worker before restart (default: 1000)</li>
 %%   <li>`max_concurrent' - Max concurrent requests queued (default: 10000)</li>
-%%   <li>`preload_app' - Preload app before forking workers (default: false)</li>
 %%   <li>`pythonpath' - Additional Python paths (default: ["."])</li>
 %%   <li>`venv' - Virtual environment path (default: undefined)</li>
 %%   <li>`lifespan' - Lifespan protocol: auto, on, off (default: auto)</li>
 %%   <li>`lifespan_timeout' - Lifespan startup/shutdown timeout in ms (default: 30000)</li>
 %%   <li>`websocket_timeout' - WebSocket idle timeout in ms (default: 60000)</li>
 %%   <li>`websocket_max_frame_size' - Max WebSocket frame size (default: 16MB)</li>
-%%   <li>`routes' - Custom Cowboy routes [{Path, Handler, Opts}] (default: [])</li>
+%%   <li>`routes' - Custom livery routes [{Method, Pattern, Handler}] (default: [])</li>
 %% </ul>
 -spec start(app_spec(), options()) -> ok | {error, term()}.
 start(AppSpec, Options) ->
@@ -155,7 +172,7 @@ start(AppSpec, Options) ->
     case parse_app_spec(AppSpec) of
         {ok, Module, Callable} ->
             %% Store configuration
-            Config = maps:merge(default_config(), Options),
+            Config = maps:merge(hornbeam_config:defaults(), Options),
             Config1 = Config#{
                 app_module => Module,
                 app_callable => Callable
@@ -167,7 +184,7 @@ start(AppSpec, Options) ->
             hornbeam_http_hooks:set_hooks(Hooks),
 
             %% Ensure Python runtime matches requested worker count.
-            %% This may restart erlang_python when workers changed.
+            %% This may restart erlang_python when num_contexts changed.
             case ensure_python_runtime(Config1) of
                 ok ->
                     %% Register hornbeam functions for Python callbacks
@@ -180,8 +197,13 @@ start(AppSpec, Options) ->
                     %% Setup Python paths
                     setup_python_paths(Config1),
 
-                    %% Run lifespan startup for ASGI apps
+                    %% Preload app in all contexts for fast access
                     WorkerClass = maps:get(worker_class, Config1),
+                    AppModule = maps:get(app_module, Config1),
+                    AppCallable = maps:get(app_callable, Config1),
+                    hornbeam_context_pool:preload_app(WorkerClass, AppModule, AppCallable),
+
+                    %% Run lifespan startup for ASGI apps
                     case maybe_run_lifespan_startup(WorkerClass, Config1) of
                         ok ->
                             %% Start the HTTP listener
@@ -196,15 +218,57 @@ start(AppSpec, Options) ->
             Error
     end.
 
-%% @doc Stop hornbeam server.
+%% @doc Stop hornbeam server and release everything `start/2' set up.
+%%
+%% The gen_servers holding this state are supervised by the application,
+%% not by the listener, so their tables and persistent_terms outlive a
+%% service. Without this teardown a second `start/2' in the same VM
+%% inherits the first run's config, hooks, channel handlers and presence,
+%% which is why restarting in one VM did not work.
+%%
+%% Ordered outside-in: stop taking requests, then run the app's shutdown,
+%% then drop the state those requests used. Every step is wrapped, so one
+%% failure cannot strand the rest.
 -spec stop() -> ok.
 stop() ->
-    %% Run lifespan shutdown first
-    _ = hornbeam_lifespan:shutdown(),
-
-    %% Stop the HTTP listener
-    _ = ranch:stop_listener(hornbeam_http),
+    %% Outside-in: stop accepting, then let the app shut down, then drop
+    %% the state those requests used. The list is the order.
+    _ = [safe(Step) || Step <- [
+        fun hornbeam_listener:stop_service/0,
+        fun hornbeam_lifespan:shutdown/0,
+        fun hornbeam_http_hooks:clear/0,
+        fun hornbeam_hooks:clear/0,
+        fun hornbeam_channel_registry:clear/0,
+        fun hornbeam_presence:clear/0,
+        fun hornbeam_services:reset/0,
+        fun hornbeam_state:clear/0,
+        fun hornbeam_config:reset/0
+    ]],
     ok.
+
+%% @private Run a teardown step, swallowing a crash or a dead server.
+%% Stopping must be idempotent and must not depend on what is still up.
+safe(F) ->
+    try F()
+    catch Class:Reason ->
+        logger:debug("hornbeam stop step failed: ~p:~p", [Class, Reason]),
+        ok
+    end.
+
+%% @doc Listener status: `#{running := boolean(), listeners := map()}'.
+%%
+%% `listeners' maps each running protocol (`h1', `h2', `h3') to the list
+%% of ports serving it. A list because the mapping is many-to-many: an
+%% ALPN listener serves `h1' and `h2' from one port, and `h1' can also be
+%% on a second, cleartext port beside it.
+-spec info() -> #{running := boolean(), listeners := #{h1 | h2 | h3 => [inet:port_number()]}}.
+info() ->
+    hornbeam_listener:info().
+
+%% @doc Whether the HTTP listener is running.
+-spec is_running() -> boolean().
+is_running() ->
+    hornbeam_listener:is_running().
 
 %% @doc Register an Erlang function to be callable from Python.
 %% The function should accept a list of arguments and return a term.
@@ -255,13 +319,13 @@ start_multi(Config) ->
             Hooks = maps:get(hooks, GlobalConfig, #{}),
             hornbeam_http_hooks:set_hooks(Hooks),
 
-            %% Calculate max workers needed (max across all mounts)
-            MaxWorkers = lists:foldl(fun(Mount, Max) ->
-                max(Max, maps:get(workers, Mount, 4))
+            %% Calculate max contexts needed (max across all mounts)
+            MaxContexts = lists:foldl(fun(Mount, Max) ->
+                max(Max, maps:get(num_contexts, Mount, 4))
             end, 4, NormalizedMounts),
 
-            %% Ensure Python runtime with max workers
-            case ensure_python_runtime(GlobalConfig#{workers => MaxWorkers}) of
+            %% Ensure Python runtime with max contexts
+            case ensure_python_runtime(GlobalConfig#{num_contexts => MaxContexts}) of
                 ok ->
                     %% Register hornbeam functions for Python callbacks
                     register_python_callbacks(),
@@ -311,13 +375,7 @@ add_to_sys_path(Path) ->
 %% @private
 %% Default config for multi-app mode (global settings only)
 default_multi_config() ->
-    #{
-        bind => <<"127.0.0.1:8000">>,
-        num_acceptors => 100,
-        max_concurrent => 10000,
-        pythonpath => [<<".">>, <<"examples">>],
-        venv => undefined
-    }.
+    hornbeam_config:multi_defaults().
 
 %% @private
 %% Validate and normalize mount specs into mount records
@@ -360,7 +418,7 @@ validate_mount({Prefix, AppSpec, Opts}, GlobalConfig) ->
             %% Merge global defaults with mount-specific opts
             DefaultOpts = #{
                 worker_class => wsgi,
-                workers => maps:get(workers, GlobalConfig, 4),
+                num_contexts => maps:get(num_contexts, GlobalConfig, 4),
                 timeout => maps:get(timeout, GlobalConfig, 30000)
             },
             MountOpts = maps:merge(DefaultOpts, Opts),
@@ -372,7 +430,7 @@ validate_mount({Prefix, AppSpec, Opts}, GlobalConfig) ->
                 app_module => Module,
                 app_callable => Callable,
                 worker_class => maps:get(worker_class, MountOpts),
-                workers => maps:get(workers, MountOpts),
+                num_contexts => maps:get(num_contexts, MountOpts),
                 timeout => maps:get(timeout, MountOpts),
                 pythonpath => MountPythonpath
             };
@@ -448,12 +506,14 @@ maybe_run_multi_lifespan_startup(Mounts, Config) ->
 run_lifespan_for_mounts([], _Opts) ->
     ok;
 run_lifespan_for_mounts([Mount | Rest], Opts) ->
-    %% Store mount info in config temporarily for lifespan
-    hornbeam_config:set_config(#{
+    %% Get mount_id for per-mount state isolation
+    MountId = maps:get(mount_id, Mount),
+    %% Build mount-specific options for lifespan startup
+    MountOpts = Opts#{
         app_module => maps:get(app_module, Mount),
         app_callable => maps:get(app_callable, Mount)
-    }),
-    case hornbeam_lifespan:startup(Opts) of
+    },
+    case hornbeam_lifespan:startup(MountId, MountOpts) of
         ok -> run_lifespan_for_mounts(Rest, Opts);
         {error, _} = Error -> Error
     end.
@@ -461,68 +521,13 @@ run_lifespan_for_mounts([Mount | Rest], Opts) ->
 %% @private
 %% Start the HTTP listener in multi-app mode
 start_listener_multi(Config) ->
-    {Ip, Port} = parse_bind(maps:get(bind, Config)),
-    NumAcceptors = maps:get(num_acceptors, Config, 100),
-
-    %% Build custom routes (WebSocket handlers, etc.)
-    CustomRoutes = maps:get(routes, Config, []),
-
     %% Multi-app handler state - lookups mount per request
+    %% Lifespan state cached at startup (shared across mounts)
     HandlerState = #{
-        multi_app => true
+        multi_app => true,
+        lifespan_state => hornbeam_lifespan:get_state()
     },
-
-    %% Default catchall route for Python apps (routes to mounts)
-    DefaultRoute = {'_', hornbeam_handler, HandlerState},
-
-    %% Combine custom routes with default (custom routes take precedence)
-    AllRoutes = CustomRoutes ++ [DefaultRoute],
-
-    Dispatch = cowboy_router:compile([
-        {'_', AllRoutes}
-    ]),
-
-    %% Build protocol options including request limits
-    ProtoOpts = #{
-        env => #{dispatch => Dispatch},
-        idle_timeout => maps:get(keepalive, Config, 2) * 1000,
-        request_timeout => maps:get(timeout, Config, 30000),
-        max_request_line_length => maps:get(max_request_line_size, Config, 4094),
-        max_header_value_length => maps:get(max_header_size, Config, 8190),
-        max_headers => maps:get(max_headers, Config, 100)
-    },
-
-    %% Start with SSL/TLS or plain HTTP
-    case maps:get(ssl, Config, false) of
-        true ->
-            start_tls_listener(Ip, Port, Config, ProtoOpts);
-        false ->
-            TransportOpts = #{
-                num_acceptors => NumAcceptors,
-                socket_opts => [{port, Port}, {ip, Ip}]
-            },
-            {ok, _} = cowboy:start_clear(hornbeam_http,
-                TransportOpts, ProtoOpts),
-            ok
-    end.
-
-default_config() ->
-    #{
-        bind => <<"127.0.0.1:8000">>,
-        workers => 4,
-        num_acceptors => 100,
-        worker_class => wsgi,
-        timeout => 30000,
-        keepalive => 2,
-        max_requests => 1000,
-        max_concurrent => 10000,  % High limit for concurrent requests queued
-        preload_app => false,
-        pythonpath => [<<".">>, <<"examples">>],
-        venv => undefined,
-        lifespan => auto,
-        websocket_timeout => 60000,
-        websocket_max_frame_size => 16777216  % 16MB
-    }.
+    start_service(Config, HandlerState).
 
 parse_app_spec(AppSpec) when is_list(AppSpec) ->
     parse_app_spec(list_to_binary(AppSpec));
@@ -537,87 +542,41 @@ parse_app_spec(AppSpec) when is_binary(AppSpec) ->
     end.
 
 ensure_python_runtime(Config) ->
-    Workers = maps:get(workers, Config, 4),
-    ok = application:set_env(erlang_python, num_workers, Workers),
-    Result = case current_python_workers() of
-        {ok, Workers} ->
+    NumContexts = maps:get(num_contexts, Config, erlang:system_info(schedulers)),
+    ContextMode = maps:get(context_mode, Config, worker),
+    ok = application:set_env(hornbeam, context_pool_size, NumContexts),
+    ok = application:set_env(hornbeam, context_mode, ContextMode),
+    case current_context_count() of
+        {ok, NumContexts} ->
             ok;
         _ ->
-            restart_python_runtime()
-    end,
-    %% Ensure worker pool is started for high-concurrency ASGI
-    case Result of
-        ok -> ensure_worker_pool();
-        Error -> Error
+            restart_context_pool()
     end.
 
-ensure_worker_pool() ->
-    case py_worker_pool:stats() of
-        #{initialized := true} -> ok;
-        _ -> py_worker_pool:start_link()
+restart_context_pool() ->
+    %% Restart context pool with new size
+    case supervisor:terminate_child(hornbeam_sup, hornbeam_context_pool) of
+        ok ->
+            case supervisor:restart_child(hornbeam_sup, hornbeam_context_pool) of
+                {ok, _} -> ok;
+                {ok, _, _} -> ok;
+                {error, Reason} -> {error, {context_pool_restart_failed, Reason}}
+            end;
+        {error, not_found} ->
+            ok;
+        {error, Reason} ->
+            {error, {context_pool_terminate_failed, Reason}}
     end.
 
-current_python_workers() ->
-    try py_pool:get_stats() of
-        #{num_workers := NumWorkers} when is_integer(NumWorkers), NumWorkers > 0 ->
-            {ok, NumWorkers};
+current_context_count() ->
+    try hornbeam_context_pool:pool_size() of
+        N when is_integer(N), N > 0 ->
+            {ok, N};
         _ ->
             {error, unknown}
     catch
         _:_ ->
             {error, unavailable}
-    end.
-
-restart_python_runtime() ->
-    case application:stop(erlang_python) of
-        ok ->
-            start_python_runtime();
-        {error, {not_started, erlang_python}} ->
-            start_python_runtime();
-        {error, Reason} ->
-            {error, {python_stop_failed, Reason}}
-    end.
-
-start_python_runtime() ->
-    case application:start(erlang_python) of
-        ok ->
-            %% Start the new worker pool for high-concurrency ASGI handling
-            ok = py_worker_pool:start_link(),
-            refresh_lifespan_manager();
-        {error, {already_started, erlang_python}} ->
-            %% Ensure worker pool is started
-            case py_worker_pool:stats() of
-                #{initialized := true} -> ok;
-                _ -> ok = py_worker_pool:start_link()
-            end,
-            refresh_lifespan_manager();
-        {error, Reason} ->
-            {error, {python_start_failed, Reason}}
-    end.
-
-refresh_lifespan_manager() ->
-    case whereis(hornbeam_lifespan) of
-        undefined ->
-            ok;
-        _ ->
-            case supervisor:terminate_child(hornbeam_sup, hornbeam_lifespan) of
-                ok ->
-                    restart_lifespan_manager();
-                {error, not_found} ->
-                    ok;
-                {error, Reason} ->
-                    {error, {lifespan_terminate_failed, Reason}}
-            end
-    end.
-
-restart_lifespan_manager() ->
-    case supervisor:restart_child(hornbeam_sup, hornbeam_lifespan) of
-        {ok, _Pid} ->
-            ok;
-        {ok, _Pid, _Info} ->
-            ok;
-        {error, Reason} ->
-            {error, {lifespan_restart_failed, Reason}}
     end.
 
 setup_python_paths(Config) ->
@@ -665,7 +624,11 @@ setup_python_paths(Config) ->
             "import sys; sys.path.insert(0, '~s') if '~s' not in sys.path else None",
             [AbsPath, AbsPath]),
         py:exec(Code)
-    end, AbsPaths).
+    end, AbsPaths),
+
+    %% Also add paths to all contexts in the pool
+    %% This is needed because context_call uses separate Python contexts
+    hornbeam_context_pool:add_paths(AbsPaths).
 
 maybe_run_lifespan_startup(asgi, Config) ->
     LifespanMode = maps:get(lifespan, Config, auto),
@@ -678,84 +641,302 @@ maybe_run_lifespan_startup(wsgi, _Config) ->
     ok.
 
 start_listener(Config) ->
-    {Ip, Port} = parse_bind(maps:get(bind, Config)),
-    NumAcceptors = maps:get(num_acceptors, Config, 100),
-    WorkerClass = maps:get(worker_class, Config),
-
-    %% Build custom routes (WebSocket handlers, etc.)
-    CustomRoutes = maps:get(routes, Config, []),
-
     %% Cache frequently accessed config values in handler state to avoid
     %% repeated ETS lookups per request
+    %% Lifespan state is fetched once here since it doesn't change after startup
     HandlerState = #{
-        worker_class => WorkerClass,
+        worker_class => maps:get(worker_class, Config),
         app_module => maps:get(app_module, Config),
         app_callable => maps:get(app_callable, Config),
-        timeout => maps:get(timeout, Config, 30000)
+        timeout => maps:get(timeout, Config, 30000),
+        lifespan_state => hornbeam_lifespan:get_state()
     },
+    start_service(Config, HandlerState).
 
-    %% Default catchall route for Python app
-    DefaultRoute = {'_', hornbeam_handler, HandlerState},
-
-    %% Combine custom routes with default (custom routes take precedence)
-    AllRoutes = CustomRoutes ++ [DefaultRoute],
-
-    Dispatch = cowboy_router:compile([
-        {'_', AllRoutes}
-    ]),
-
-    %% Build protocol options including request limits
-    ProtoOpts = #{
-        env => #{dispatch => Dispatch},
-        idle_timeout => maps:get(keepalive, Config) * 1000,
-        request_timeout => maps:get(timeout, Config),
-        %% Cowboy HTTP options for request limits
-        max_request_line_length => maps:get(max_request_line_size, Config, 4094),
-        max_header_value_length => maps:get(max_header_size, Config, 8190),
-        max_headers => maps:get(max_headers, Config, 100)
+%% @private
+%% Build the livery service opts from hornbeam config and start it under
+%% the supervised hornbeam_listener owner. The handler state is exposed to
+%% request handlers via livery_req:config/1.
+start_service(Config, HandlerState0) ->
+    {Ip, Port} = parse_bind(maps:get(bind, Config, hornbeam_config:default_bind())),
+    Ssl = maps:get(ssl, Config, false),
+    Versions = maps:get(http_version, Config, ['HTTP/1.1']),
+    BaseOpts = #{
+        port => Port,
+        ip => Ip,
+        acceptors => maps:get(num_acceptors, Config, 100),
+        idle_timeout => maps:get(keepalive, Config, 2) * 1000,
+        request_timeout => maps:get(timeout, Config, 30000),
+        %% No request-body cap by default: hornbeam streamed bodies
+        %% unbounded under cowboy; livery's own default is 16 MiB.
+        max_body => maps:get(max_body, Config, infinity)
     },
+    with_ok([
+        fun() -> validate_versions(Versions, Ssl) end,
+        fun() -> build_listeners(Versions, Ssl, Config, BaseOpts, HandlerState0) end,
+        fun(Listeners) -> merge_routing(Config, Listeners) end
+    ]).
 
-    %% Start with SSL/TLS or plain HTTP
-    case maps:get(ssl, Config, false) of
-        true ->
-            start_tls_listener(Ip, Port, Config, ProtoOpts);
-        false ->
-            TransportOpts = #{
-                num_acceptors => NumAcceptors,
-                socket_opts => [{port, Port}, {ip, Ip}]
-            },
-            {ok, _} = cowboy:start_clear(hornbeam_http,
-                TransportOpts, ProtoOpts),
-            ok
+%% @private
+%% Thread a list of steps, short-circuiting on the first error. The first
+%% step takes no argument; each later one takes the previous step's value.
+with_ok([First | Rest]) ->
+    with_ok(Rest, First()).
+
+with_ok(_Steps, {error, _} = Error) ->
+    Error;
+with_ok([], Result) ->
+    Result;
+with_ok([Step | Rest], ok) ->
+    with_ok(Rest, Step());
+with_ok([Step | Rest], {ok, Value}) ->
+    with_ok(Rest, Step(Value)).
+
+%% @private
+merge_routing(Config, Listeners) ->
+    case build_routing(maps:get(routes, Config, [])) of
+        {ok, Routing} ->
+            hornbeam_listener:start_service(maps:merge(Routing, Listeners));
+        {error, _} = Error ->
+            Error
     end.
 
 %% @private
-%% Start SSL/TLS listener with certificate configuration
-start_tls_listener(Ip, Port, Config, ProtoOpts) ->
-    NumAcceptors = maps:get(num_acceptors, Config, 100),
-    CertFile = maps:get(certfile, Config, undefined),
-    KeyFile = maps:get(keyfile, Config, undefined),
-    CaCertFile = maps:get(cacertfile, Config, undefined),
-    case {CertFile, KeyFile} of
-        {undefined, _} ->
-            {error, {missing_ssl_option, certfile}};
-        {_, undefined} ->
-            {error, {missing_ssl_option, keyfile}};
-        _ ->
-            SocketOpts = [{port, Port}, {ip, Ip},
-                          {certfile, ensure_list(CertFile)},
-                          {keyfile, ensure_list(KeyFile)}] ++
-                         case CaCertFile of
-                             undefined -> [];
-                             _ -> [{cacertfile, ensure_list(CaCertFile)}]
-                         end,
-            TransportOpts = #{
-                num_acceptors => NumAcceptors,
-                socket_opts => SocketOpts
-            },
-            {ok, _} = cowboy:start_tls(hornbeam_http, TransportOpts, ProtoOpts),
+%% `HTTP/2' and `HTTP/3' exist only over TLS, so asking for either without
+%% `ssl => true' is rejected rather than quietly served as HTTP/1.1.
+validate_versions([], _Ssl) ->
+    {error, {invalid_http_version, []}};
+validate_versions(Versions, Ssl) when is_list(Versions) ->
+    Known = ['HTTP/1.1', 'HTTP/2', 'HTTP/3'],
+    case [V || V <- Versions, not lists:member(V, Known)] of
+        [Bad | _] ->
+            {error, {invalid_http_version, Bad}};
+        [] when not Ssl ->
+            case [V || V <- Versions, V =/= 'HTTP/1.1'] of
+                [NeedsTls | _] -> {error, {http_version_requires_ssl, NeedsTls}};
+                [] -> ok
+            end;
+        [] ->
             ok
+    end;
+validate_versions(Other, _Ssl) ->
+    {error, {invalid_http_version, Other}}.
+
+%% @private
+%% One livery listener entry per wire protocol. Each carries its own
+%% `config' (the handler state), because `server_scheme' differs between a
+%% cleartext and a TLS listener in the same service and livery lets a
+%% per-listener config override the service-wide one.
+build_listeners(Versions, Ssl, Config, BaseOpts, HandlerState) ->
+    H1 = lists:member('HTTP/1.1', Versions),
+    H2 = lists:member('HTTP/2', Versions),
+    H3 = lists:member('HTTP/3', Versions),
+    Limits = limit_opts(Config),
+    with_ok([
+        fun() -> {ok, #{}} end,
+        fun(Acc) -> add_tcp_or_tls(Acc, H1, H2, Ssl, Config, BaseOpts, Limits, HandlerState) end,
+        fun(Acc) -> add_h3(Acc, H3, Config, BaseOpts, HandlerState) end
+    ]).
+
+%% @private
+%% Without HTTP/2 the `bind' port is an h1 listener, cleartext or TLS. With
+%% it, the port becomes livery's ALPN listener: `[h2, http1]' serves both
+%% and prefers h2, `[h2]' alone is h2-only.
+add_tcp_or_tls(Acc, false, false, _Ssl, _Config, _BaseOpts, _Limits, _HandlerState) ->
+    {ok, Acc};
+add_tcp_or_tls(Acc, true, false, false, _Config, BaseOpts, Limits, HandlerState) ->
+    Opts = maps:merge(BaseOpts, Limits),
+    {ok, Acc#{http => Opts#{config => listener_state(HandlerState, <<"http">>, BaseOpts)}}};
+add_tcp_or_tls(Acc, true, false, true, Config, BaseOpts, Limits, HandlerState) ->
+    case tls_opts(Config) of
+        {ok, Tls} ->
+            Opts = maps:merge(maps:merge(BaseOpts, Limits), Tls),
+            {ok, Acc#{http => Opts#{
+                transport => ssl,
+                config => listener_state(HandlerState, <<"https">>, BaseOpts)
+            }}};
+        {error, _} = Error ->
+            Error
+    end;
+add_tcp_or_tls(Acc, H1, true, true, Config, BaseOpts, Limits, HandlerState) ->
+    Alpn = case H1 of
+        true -> [h2, http1];
+        false -> [h2]
+    end,
+    case tls_opts(Config) of
+        {ok, Tls} ->
+            Opts = maps:merge(maps:merge(BaseOpts, Limits), Tls),
+            {ok, Acc#{https => Opts#{
+                alpn => Alpn,
+                config => listener_state(HandlerState, <<"https">>, BaseOpts)
+            }}};
+        {error, _} = Error ->
+            Error
     end.
+
+%% @private
+%% HTTP/3 is QUIC over UDP, so it can hold the same port number as the TCP
+%% listener beside it. livery derives a stable listener name from the port.
+add_h3(Acc, false, _Config, _BaseOpts, _HandlerState) ->
+    {ok, Acc};
+add_h3(Acc, true, Config, BaseOpts, HandlerState) ->
+    case tls_der(Config) of
+        {ok, #{cert := Cert, key := Key}} ->
+            Port = case maps:get(http3_port, Config, undefined) of
+                undefined -> maps:get(port, BaseOpts);
+                Explicit -> Explicit
+            end,
+            H3Opts = #{
+                port => Port,
+                ip => maps:get(ip, BaseOpts),
+                max_body => maps:get(max_body, BaseOpts),
+                cert => Cert,
+                key => Key,
+                config => listener_state(HandlerState, <<"https">>, BaseOpts#{port => Port})
+            },
+            {ok, Acc#{http3 => H3Opts, alt_svc => advertise}};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @private
+%% `livery_req:scheme/1' reports `<<"http">>' on HTTP/1.1 even under TLS,
+%% so the scheme a listener serves is recorded here per listener rather
+%% than once per service.
+listener_state(HandlerState, Scheme, BaseOpts) ->
+    HandlerState#{
+        server_scheme => Scheme,
+        server_port => maps:get(port, BaseOpts)
+    }.
+
+%% @private
+%% hornbeam's limit names predate livery; map them onto h1's.
+limit_opts(Config) ->
+    #{
+        max_request_line_size => maps:get(max_request_line_size, Config, 4094),
+        max_header_value_size => maps:get(max_header_size, Config, 8190),
+        max_headers => maps:get(max_headers, Config, 100)
+    }.
+
+%% @private
+%% TLS material as file paths, which is what livery's h1 and h2 listeners take.
+tls_opts(Config) ->
+    case cert_key_files(Config) of
+        {ok, CertFile, KeyFile} ->
+            SslOpts = case maps:get(cacertfile, Config, undefined) of
+                undefined -> [];
+                CaCertFile -> [{cacertfile, ensure_list(CaCertFile)}]
+            end,
+            {ok, #{
+                cert => ensure_list(CertFile),
+                key => ensure_list(KeyFile),
+                ssl_opts => SslOpts
+            }};
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @private
+%% The h3 listener takes DER instead: the certificate as raw DER bytes and
+%% the private key as a decoded key term.
+tls_der(Config) ->
+    case cert_key_files(Config) of
+        {ok, CertFile, KeyFile} ->
+            with_ok([
+                fun() -> read_pem(certfile, CertFile) end,
+                fun(CertEntries) ->
+                    case [D || {'Certificate', D, _} <- CertEntries] of
+                        [Der | _] -> {ok, Der};
+                        [] -> {error, {no_certificate_in_pem, CertFile}}
+                    end
+                end,
+                fun(CertDer) ->
+                    case read_pem(keyfile, KeyFile) of
+                        {ok, KeyEntries} -> decode_key(KeyEntries, KeyFile, CertDer);
+                        {error, _} = Error -> Error
+                    end
+                end
+            ]);
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @private
+cert_key_files(Config) ->
+    case {maps:get(certfile, Config, undefined), maps:get(keyfile, Config, undefined)} of
+        {undefined, _} -> {error, {missing_ssl_option, certfile}};
+        {_, undefined} -> {error, {missing_ssl_option, keyfile}};
+        {CertFile, KeyFile} -> {ok, CertFile, KeyFile}
+    end.
+
+%% @private
+read_pem(Which, File) ->
+    case file:read_file(File) of
+        {ok, Pem} ->
+            case public_key:pem_decode(Pem) of
+                [] -> {error, {empty_pem, Which, File}};
+                Entries -> {ok, Entries}
+            end;
+        {error, Reason} ->
+            {error, {unreadable_pem, Which, File, Reason}}
+    end.
+
+%% @private
+%% quic wants the key as a decoded record, not as DER bytes.
+decode_key(Entries, KeyFile, CertDer) ->
+    KeyTypes = ['RSAPrivateKey', 'ECPrivateKey', 'PrivateKeyInfo'],
+    case [{T, D} || {T, D, not_encrypted} <- Entries, lists:member(T, KeyTypes)] of
+        [{Type, Der} | _] ->
+            {ok, #{cert => CertDer, key => public_key:der_decode(Type, Der)}};
+        [] ->
+            {error, {no_private_key_in_pem, KeyFile}}
+    end.
+
+%% @private
+%% No custom routes: hand every request to the catch-all handler. With
+%% routes, compile a livery router with the catch-all as wildcard fallback
+%% so custom routes take precedence, as before.
+build_routing([]) ->
+    {ok, #{handler => fun hornbeam_handler:handle/1}};
+build_routing(Routes) when is_list(Routes) ->
+    try
+        Entries = [validate_route(R) || R <- Routes],
+        Fallback = {'_', <<"/*hb_rest">>, fun hornbeam_handler:handle/1},
+        {ok, #{router => livery_router:compile(Entries ++ [Fallback])}}
+    catch
+        throw:{invalid_route, _} = Reason ->
+            {error, Reason}
+    end;
+build_routing(Other) ->
+    {error, {invalid_routes, Other}}.
+
+%% @private
+%% Routes use livery shapes: {Method | '_', Pattern, Handler[, Meta]} with
+%% Handler a fun/1 or {Module, Function}. The old cowboy
+%% {Path, HandlerModule, Opts} shape is rejected.
+validate_route({Method, Pattern, Handler}) ->
+    {validate_route_method(Method), validate_route_pattern(Pattern),
+     validate_route_handler(Handler)};
+validate_route({Method, Pattern, Handler, Meta}) when is_map(Meta) ->
+    {validate_route_method(Method), validate_route_pattern(Pattern),
+     validate_route_handler(Handler), Meta};
+validate_route(Route) ->
+    throw({invalid_route, Route}).
+
+%% @private
+validate_route_method('_') -> '_';
+validate_route_method(M) when is_binary(M) -> M;
+validate_route_method(M) -> throw({invalid_route, {method, M}}).
+
+%% @private
+validate_route_pattern(P) when is_binary(P) -> P;
+validate_route_pattern(P) when is_list(P) -> list_to_binary(P);
+validate_route_pattern(P) -> throw({invalid_route, {pattern, P}}).
+
+%% @private
+validate_route_handler(H) when is_function(H, 1) -> H;
+validate_route_handler({M, F} = H) when is_atom(M), is_atom(F) -> H;
+validate_route_handler(H) -> throw({invalid_route, {handler, H}}).
 
 %% @private
 ensure_list(V) when is_list(V) -> V;
@@ -773,8 +954,10 @@ parse_bind(Bind) when is_binary(Bind) ->
                     IpTuple = parse_ip(Ipv6),
                     {IpTuple, Port};
                 _ ->
-                    %% Invalid format, default to IPv4 any
-                    {{0, 0, 0, 0}, 8000}
+                    %% Invalid format, default to IPv4 any on the
+                    %% configured default port rather than a literal.
+                    {_, DefPort} = parse_bind(hornbeam_config:default_bind()),
+                    {{0, 0, 0, 0}, DefPort}
             end;
         _ ->
             %% IPv4 format: ip:port or just port
@@ -806,6 +989,9 @@ ensure_binary(V) when is_atom(V) -> atom_to_binary(V, utf8).
 
 %% Register hornbeam functions so Python can call them via erlang.call()
 register_python_callbacks() ->
+    py:register_function(hornbeam_ws_output, fun hornbeam_ws_handler:output/1),
+    %% Generic async-call service boundary; no application framework dependency.
+    py:register_function(hornbeam_services, fun hornbeam_services:callback/1),
     %% Hook registration (called from Python to register/unregister hooks)
     py:register_function(hornbeam_hooks, fun([Action, Args]) ->
         dispatch_hooks_action(Action, Args)
@@ -836,11 +1022,112 @@ register_python_callbacks() ->
     py:register_function(hornbeam_state_decr, fun([Key, Delta]) ->
         hornbeam_state:decr(Key, Delta)
     end),
+    %% Multi-arg state ops (get_multi, keys). Python routes here for both.
+    py:register_function(hornbeam_state, fun([Action, Args]) ->
+        dispatch_state_action(Action, Args)
+    end),
     %% Distributed Erlang functions
     py:register_function(hornbeam_dist, fun([Func, Args]) ->
         dispatch_dist_action(Func, Args)
     end),
+    %% User-registered callbacks (hornbeam_callbacks). Routes
+    %% hornbeam_erlang.call/cast from Python through the gen_server.
+    py:register_function(hornbeam_callbacks, fun([Action, Payload]) ->
+        dispatch_callbacks_action(Action, Payload)
+    end),
+    %% Pub/Sub. hornbeam_erlang.publish() routes here.
+    py:register_function(hornbeam_pubsub, fun([Action, Payload]) ->
+        dispatch_pubsub_action(Action, Payload)
+    end),
+    %% Presence. priv/hornbeam_presence.py calls
+    %% erlang.call('hornbeam_presence', Action, Args...), so the fun
+    %% receives [Action | Args]. Without this registration every call
+    %% raised on the Python side and hornbeam_channels.py swallowed it
+    %% with a print, so presence from Python silently did nothing.
+    py:register_function(hornbeam_presence, fun(Args) ->
+        dispatch_presence_action(Args)
+    end),
+    %% Channel handler registration. priv/hornbeam_channels.py calls this
+    %% when a @channel class is defined.
+    py:register_function(hornbeam_channel_registry, fun(Args) ->
+        dispatch_channel_registry_action(Args)
+    end),
+    %% Pushing an event to a channel socket.
+    py:register_function(hornbeam_channel, fun(Args) ->
+        dispatch_channel_action(Args)
+    end),
     ok.
+
+%% Dispatch presence actions from Python.
+%%
+%% Answers `ok' rather than `{ok, _}' for the mutating calls because
+%% priv/hornbeam_presence.py compares the result against the atom `ok'.
+dispatch_presence_action([<<"track">>, Topic, Pid, Key, Meta]) when is_pid(Pid) ->
+    hornbeam_presence:track(Topic, Pid, Key, Meta);
+dispatch_presence_action([<<"update">>, Topic, Pid, Key, Meta]) when is_pid(Pid) ->
+    hornbeam_presence:update(Topic, Pid, Key, Meta);
+dispatch_presence_action([<<"untrack">>, Topic, Pid, Key]) when is_pid(Pid) ->
+    hornbeam_presence:untrack(Topic, Pid, Key);
+dispatch_presence_action([<<"untrack_all">>, Topic, Pid]) when is_pid(Pid) ->
+    hornbeam_presence:untrack_all(Topic, Pid);
+dispatch_presence_action([<<"list">>, Topic]) ->
+    hornbeam_presence:list(Topic);
+dispatch_presence_action([<<"get_by_key">>, Topic, Key]) ->
+    hornbeam_presence:get_by_key(Topic, Key);
+dispatch_presence_action(Args) ->
+    {error, {unknown_presence_action, action_of(Args)}}.
+
+%% Dispatch channel-registry actions from Python.
+dispatch_channel_registry_action([<<"register">>, Pattern, HandlerInfo])
+        when is_binary(Pattern), is_map(HandlerInfo) ->
+    hornbeam_channel_registry:register(Pattern, HandlerInfo);
+dispatch_channel_registry_action([<<"unregister">>, Pattern])
+        when is_binary(Pattern) ->
+    hornbeam_channel_registry:unregister(Pattern);
+dispatch_channel_registry_action(Args) ->
+    {error, {unknown_channel_registry_action, action_of(Args)}}.
+
+%% Dispatch channel actions from Python.
+dispatch_channel_action([<<"push">>, Pid, Topic, Event, Payload])
+        when is_pid(Pid), is_map(Payload) ->
+    hornbeam_channel:push(Pid, Topic, Event, Payload);
+dispatch_channel_action(Args) ->
+    {error, {unknown_channel_action, action_of(Args)}}.
+
+%% @private The action name from a dispatch list, for an error that says
+%% which call was refused rather than echoing the arguments back.
+action_of([Action | _]) -> Action;
+action_of(_) -> undefined.
+
+%% Dispatch hornbeam_callbacks actions from Python
+dispatch_callbacks_action(<<"call">>, [Name, Args]) ->
+    hornbeam_callbacks:call(to_callback_name(Name), Args);
+dispatch_callbacks_action(<<"cast">>, [Name, Args]) ->
+    hornbeam_callbacks:cast(to_callback_name(Name), Args);
+dispatch_callbacks_action(Action, _Payload) ->
+    {error, {unknown_callbacks_action, Action}}.
+
+to_callback_name(N) when is_atom(N) -> N;
+to_callback_name(N) when is_binary(N) ->
+    try binary_to_existing_atom(N, utf8)
+    catch error:badarg -> N
+    end.
+
+%% Dispatch pub/sub actions from Python
+dispatch_pubsub_action(<<"publish">>, [Topic, Message]) ->
+    hornbeam_pubsub:publish(Topic, Message);
+dispatch_pubsub_action(Action, _Payload) ->
+    {error, {unknown_pubsub_action, Action}}.
+
+%% Dispatch multi-key state ops from Python
+dispatch_state_action(<<"get_multi">>, [Keys]) ->
+    hornbeam_state:get_multi(Keys);
+dispatch_state_action(<<"keys">>, []) ->
+    hornbeam_state:keys();
+dispatch_state_action(<<"keys">>, [Prefix]) ->
+    hornbeam_state:keys(Prefix);
+dispatch_state_action(Action, _Args) ->
+    {error, {unknown_state_action, Action}}.
 
 %% Dispatch distributed Erlang actions from Python
 dispatch_dist_action(<<"rpc_call">>, [Node, Module, Function, Args, Timeout]) ->
@@ -867,5 +1154,13 @@ dispatch_hooks_action(<<"reg_python">>, [AppPath]) ->
     hornbeam_hooks:reg_python(ensure_binary(AppPath));
 dispatch_hooks_action(<<"unreg">>, [AppPath]) ->
     hornbeam_hooks:unreg(ensure_binary(AppPath));
+dispatch_hooks_action(<<"stream">>, [AppPath, Action, Args, Kwargs]) ->
+    %% Python can't keep a reference to an Erlang fun, so route through
+    %% stream_ref/4 which stores the generator inside the gen_server and
+    %% returns an opaque reference.
+    hornbeam_hooks:stream_ref(ensure_binary(AppPath),
+                              ensure_binary(Action), Args, Kwargs);
+dispatch_hooks_action(<<"stream_next_ref">>, [GenRef]) ->
+    hornbeam_hooks:stream_next_ref(GenRef);
 dispatch_hooks_action(Action, Args) ->
     {error, {unknown_hooks_action, Action, Args}}.

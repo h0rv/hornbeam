@@ -12,26 +12,64 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 
-%%% @doc Cowboy HTTP handler for hornbeam.
+%%% @doc Livery HTTP handler for hornbeam.
 %%%
 %%% This module handles HTTP requests and routes them to either WSGI or ASGI
-%%% handlers based on configuration. It also handles WebSocket upgrades
-%%% for ASGI applications.
+%%% handlers based on configuration.
+%%%
+%%% Architecture:
+%%% - WSGI: Uses context_call with schedule_inline for yielding
+%%% - ASGI: Uses py_event_loop for full async execution
+%%% - Both stream responses via erlang.reply()/send()
+%%%
+%%% The request runs in its own livery request process; request-body
+%%% chunks are pushed to that process as `{livery_body, Ref, _}' messages
+%%% and Python response events arrive as plain messages, so a single
+%%% selective receive drives both.
+%%%
+%%% @end
 -module(hornbeam_handler).
 
--behaviour(cowboy_websocket).
+-export([handle/1]).
 
--export([init/2]).
-%% WebSocket callbacks (delegate to hornbeam_websocket)
--export([websocket_init/1, websocket_handle/2, websocket_info/2, terminate/3]).
+%% Shared helpers used by hornbeam_asgi
+-export([
+    build_request_info/2,
+    filter_hop_by_hop/1,
+    convert_headers/1,
+    parse_status_code/1,
+    error_decision/2,
+    get_content_length/1,
+    to_binary/1
+]).
 
-init(Req, #{multi_app := true} = State) ->
+%% Streaming threshold: bodies larger than this are streamed via the
+%% receive loop while Python runs; smaller ones are read inline first.
+-define(WSGI_STREAMING_THRESHOLD, 65536).  %% 64KB
+
+%% Hop-by-hop headers that should not be forwarded
+-define(HOP_BY_HOP_HEADERS, [
+    <<"connection">>, <<"keep-alive">>, <<"proxy-authenticate">>,
+    <<"proxy-authorization">>, <<"te">>, <<"trailers">>,
+    <<"transfer-encoding">>, <<"upgrade">>
+]).
+
+-spec handle(livery_req:req()) -> livery_resp:resp().
+handle(Req) ->
+    State = case livery_req:config(Req) of
+        Map when is_map(Map) -> Map;
+        _ -> #{}
+    end,
+    dispatch(Req, State).
+
+dispatch(Req, #{multi_app := true} = State) ->
     %% Multi-app mode: lookup mount based on request path
-    Path = cowboy_req:path(Req),
+    Path = livery_req:path(Req),
     case hornbeam_mounts:lookup(Path) of
         {ok, Mount, PathInfo} ->
-            %% Setup mount's pythonpath if specified
-            setup_mount_pythonpath(Mount),
+            %% pythonpath is setup at mount registration time (hornbeam_mounts.erl)
+            %% Get mount_id for per-mount lifespan state isolation
+            MountId = maps:get(mount_id, Mount),
             %% Build new state from mount config
             NewState = State#{
                 app_module => maps:get(app_module, Mount),
@@ -39,19 +77,18 @@ init(Req, #{multi_app := true} = State) ->
                 worker_class => maps:get(worker_class, Mount),
                 timeout => maps:get(timeout, Mount),
                 script_name => maps:get(prefix, Mount),
-                path_info => PathInfo
+                path_info => PathInfo,
+                mount_id => MountId,
+                %% Get per-mount lifespan state (not global)
+                lifespan_state => hornbeam_lifespan:get_state(MountId)
             },
             WorkerClass = maps:get(worker_class, Mount),
             handle_request(WorkerClass, Req, NewState);
         {error, no_match} ->
             %% No mount matched - return 404
-            Req2 = cowboy_req:reply(404,
-                                    #{<<"content-type">> => <<"text/plain">>},
-                                    <<"Not Found">>,
-                                    Req),
-            {ok, Req2, State}
+            livery_resp:text(404, <<"Not Found">>)
     end;
-init(Req, State) ->
+dispatch(Req, State) ->
     %% Single-app mode (backward compatible)
     WorkerClass = maps:get(worker_class, State, wsgi),
     handle_request(WorkerClass, Req, State).
@@ -62,278 +99,297 @@ handle_request(asgi, Req, State) ->
     %% Check for WebSocket upgrade
     case is_websocket_upgrade(Req) of
         true ->
-            handle_websocket_upgrade(Req, State);
+            hornbeam_websocket:upgrade(Req, State);
         false ->
-            handle_asgi(Req, State)
+            hornbeam_asgi:handle(Req, State)
     end.
 
 %% @private
 is_websocket_upgrade(Req) ->
-    case cowboy_req:header(<<"upgrade">>, Req) of
+    case livery_req:header(<<"upgrade">>, Req) of
         undefined -> false;
         Upgrade ->
             string:lowercase(Upgrade) =:= <<"websocket">>
     end.
 
-%% @private
-handle_websocket_upgrade(Req, State) ->
-    %% Delegate to WebSocket handler
-    hornbeam_websocket:init(Req, State).
-
 %%% ============================================================================
-%%% WSGI Handler
+%%% WSGI Handler - unified channel-based approach with schedule_inline
 %%% ============================================================================
 
 handle_wsgi(Req, State) ->
-    %% Start profiling if enabled
-    Prof0 = hornbeam_profiler:start_request(),
-
-    %% Build initial request map for hooks (measures cowboy parsing overhead)
-    ReqInfo = build_request_info(Req),
-    Prof1 = hornbeam_profiler:mark(cowboy_parse, Prof0),
-
-    %% Run on_request hook
+    ReqInfo = build_request_info(Req, State),
     ReqInfo1 = hornbeam_http_hooks:run_on_request(ReqInfo),
-    Prof2 = hornbeam_profiler:mark(hooks_request, Prof1),
 
     try
-        %% Get app module and callable from cached state (avoids ETS lookups)
         AppModule = maps:get(app_module, State),
         AppCallable = maps:get(app_callable, State),
         TimeoutMs = maps:get(timeout, State, 30000),
 
-        %% Check if context affinity is required (for module-level state sharing)
-        %% Use optimized NIF path by default, fall back to ctx_call when needed
-        UseContextAffinity = maps:get(context_affinity, State, false),
-        PyContext = case UseContextAffinity of
-            true -> hornbeam_lifespan:get_context();
-            false -> undefined
-        end,
+        %% Build pre-parsed WSGI tuple (O(1) environ creation in Python)
+        ReqTuple = hornbeam_request:build_wsgi_tuple(Req, State),
 
-        Result = case PyContext of
-            undefined ->
-                %% Optimized py_wsgi:run/4 path (NIF-based marshalling)
-                run_wsgi_optimized_profiled(Req, AppModule, AppCallable, State, Prof2);
-            Ctx ->
-                %% Context affinity path - uses same worker as lifespan
-                run_wsgi_with_context_profiled(Req, AppModule, AppCallable, Ctx, TimeoutMs, State, Prof2)
-        end,
+        %% Create buffer for request body (skip for bodyless requests).
+        %% Small bodies are read inline; large ones stream into the
+        %% buffer inside the receive loop while Python already runs.
+        {Buffer, BodyCtx} = setup_body(Req, TimeoutMs),
 
-        case Result of
-            {ok, Response, Prof3} ->
-                %% Run on_response hook
-                Response1 = hornbeam_http_hooks:run_on_response(Response),
-                Prof4 = hornbeam_profiler:mark(hooks_response, Prof3),
-                send_wsgi_response_profiled(Req, Response1, State, Prof4);
-            {error, {overloaded, Current, Max}} ->
-                hornbeam_profiler:end_request(Prof2),
-                overload_response(Req, Current, Max, State);
-            {error, Error} ->
-                hornbeam_profiler:end_request(Prof2),
-                handle_error(Req, Error, ReqInfo1, State)
+        %% Call Python with tuple fast path
+        CtxRef = hornbeam_context_pool:get_context_ref(),
+        case py_nif:context_call(CtxRef,
+                <<"hornbeam_wsgi_worker">>, <<"handle_request_tuple">>,
+                [self(), Buffer, AppModule, AppCallable, ReqTuple], #{}) of
+            {ok, <<"done">>} ->
+                %% Resolve status/headers once Python replies
+                livery_resp:stream_deferred(fun() ->
+                    wsgi_wait(BodyCtx, ReqInfo1, TimeoutMs)
+                end);
+            {ok, <<"error">>} ->
+                close_body(BodyCtx),
+                error_resp(wsgi_error, ReqInfo1);
+            {error, Reason} ->
+                close_body(BodyCtx),
+                error_resp(Reason, ReqInfo1)
         end
     catch
-        Class:Reason:Stack ->
-            hornbeam_profiler:end_request(Prof2),
+        Class:Error:Stack ->
             error_logger:error_msg("WSGI handler error: ~p:~p~n~p~n",
-                                   [Class, Reason, Stack]),
-            handle_error(Req, {Class, Reason}, ReqInfo1, State)
+                                   [Class, Error, Stack]),
+            error_resp({Class, Error}, ReqInfo1)
     end.
 
 %% @private
-%% Optimized path using py_wsgi:run/4 with NIF marshalling
-run_wsgi_optimized(Req, AppModule, AppCallable, State) ->
-    Environ = build_environ_for_nif(Req, State),
-    case py_wsgi:run(AppModule, AppCallable, Environ,
-                     #{runner => <<"hornbeam_wsgi_runner">>}) of
-        {ok, {Status, Headers, Body}} ->
-            {ok, #{<<"status">> => Status,
-                   <<"headers">> => Headers,
-                   <<"body">> => Body}};
-        {error, _} = Error ->
-            Error
+%% Get content-length as integer, or undefined if not present/invalid
+get_content_length(Req) ->
+    case livery_req:header(<<"content-length">>, Req) of
+        undefined -> undefined;
+        CLBin ->
+            try binary_to_integer(CLBin)
+            catch _:_ -> undefined
+            end
     end.
 
 %% @private
-%% Optimized path with profiling
-run_wsgi_optimized_profiled(Req, AppModule, AppCallable, State, Prof) ->
-    Environ = build_environ_for_nif(Req, State),
-    Prof1 = hornbeam_profiler:mark(scope_build, Prof),
-    %% Note: body is read inside build_environ_for_nif
-    Prof2 = hornbeam_profiler:mark(body_read, Prof1),
-    case py_wsgi:run(AppModule, AppCallable, Environ,
-                     #{runner => <<"hornbeam_wsgi_runner">>}) of
-        {ok, {Status, Headers, Body}} ->
-            Prof3 = hornbeam_profiler:mark(python_exec, Prof2),
-            {ok, #{<<"status">> => Status,
-                   <<"headers">> => Headers,
-                   <<"body">> => Body}, Prof3};
-        {error, _} = Error ->
-            Error
+%% Check if request has a body (based on method and content-length)
+has_request_body(<<"GET">>, undefined) -> false;
+has_request_body(<<"HEAD">>, undefined) -> false;
+has_request_body(<<"DELETE">>, undefined) -> false;
+has_request_body(<<"OPTIONS">>, undefined) -> false;
+has_request_body(_, 0) -> false;
+has_request_body(_, _) -> true.
+
+%% @private
+%% Prepare the request-body buffer.
+%% Returns {BufferArg, BodyCtx} where BufferArg is the Python-side
+%% argument (`empty' or a py_buffer) and BodyCtx tracks whether body
+%% chunks still stream into the buffer ({streaming, Ref, Buffer}) or the
+%% buffer is complete (done).
+setup_body(Req, TimeoutMs) ->
+    Method = livery_req:method(Req),
+    ContentLength = get_content_length(Req),
+    case has_request_body(Method, ContentLength) of
+        false ->
+            {empty, done};
+        true when is_integer(ContentLength),
+                  ContentLength >= ?WSGI_STREAMING_THRESHOLD ->
+            {ok, Buf} = py_buffer:new(ContentLength),
+            case livery_req:body(Req) of
+                {stream, Reader} ->
+                    {Buf, {streaming, livery_body:ref(Reader), Buf}};
+                {buffered, Data} ->
+                    _ = py_buffer:write(Buf, iolist_to_binary(Data)),
+                    _ = py_buffer:close(Buf),
+                    {Buf, done};
+                empty ->
+                    _ = py_buffer:close(Buf),
+                    {Buf, done}
+            end;
+        true ->
+            {ok, Buf} = create_body_buffer(ContentLength),
+            case livery_req:body(Req) of
+                {stream, Reader} ->
+                    case livery_body:read_all(Reader, TimeoutMs, infinity) of
+                        {ok, Body, _Reader1} ->
+                            _ = py_buffer:write(Buf, Body),
+                            _ = py_buffer:close(Buf);
+                        {error, Reason, _Reader1} ->
+                            _ = py_buffer:close(Buf),
+                            throw({body_read_error, Reason})
+                    end;
+                {buffered, Data} ->
+                    _ = py_buffer:write(Buf, iolist_to_binary(Data)),
+                    _ = py_buffer:close(Buf);
+                empty ->
+                    _ = py_buffer:close(Buf)
+            end,
+            {Buf, done}
     end.
 
 %% @private
-%% Context-aware fallback path using py:ctx_call
-run_wsgi_with_context(Req, AppModule, AppCallable, PyContext, TimeoutMs, State) ->
-    %% Build environ options from state (for multi-app mode)
-    EnvOpts = case maps:get(script_name, State, undefined) of
-        undefined -> #{};
-        ScriptName -> #{script_name => ScriptName}
-    end,
-    Environ = hornbeam_wsgi:build_environ(Req, EnvOpts),
-    %% Override PATH_INFO if set in state (from mount lookup)
-    Environ1 = case maps:get(path_info, State, undefined) of
-        undefined -> Environ;
-        PathInfo -> Environ#{<<"PATH_INFO">> => PathInfo}
-    end,
-    py:ctx_call(PyContext, hornbeam_wsgi_runner, run_wsgi,
-               [AppModule, AppCallable, Environ1], #{}, TimeoutMs).
+%% Create buffer for body - pre-allocate if content-length known
+create_body_buffer(ContentLength) when is_integer(ContentLength), ContentLength > 0 ->
+    py_buffer:new(ContentLength);
+create_body_buffer(_) ->
+    py_buffer:new().
 
 %% @private
-%% Context-aware fallback path with profiling
-run_wsgi_with_context_profiled(Req, AppModule, AppCallable, PyContext, TimeoutMs, State, Prof) ->
-    EnvOpts = case maps:get(script_name, State, undefined) of
-        undefined -> #{};
-        ScriptName -> #{script_name => ScriptName}
-    end,
-    Environ = hornbeam_wsgi:build_environ(Req, EnvOpts),
-    Prof1 = hornbeam_profiler:mark(scope_build, Prof),
-    Environ1 = case maps:get(path_info, State, undefined) of
-        undefined -> Environ;
-        PathInfo -> Environ#{<<"PATH_INFO">> => PathInfo}
-    end,
-    Prof2 = hornbeam_profiler:mark(body_read, Prof1),
-    case py:ctx_call(PyContext, hornbeam_wsgi_runner, run_wsgi,
-                     [AppModule, AppCallable, Environ1], #{}, TimeoutMs) of
-        {ok, Response} ->
-            Prof3 = hornbeam_profiler:mark(python_exec, Prof2),
-            {ok, Response, Prof3};
-        Error ->
-            Error
+close_body({streaming, _Ref, Buffer}) ->
+    _ = py_buffer:close(Buffer),
+    ok;
+close_body(done) ->
+    ok.
+
+%% @private
+%% Wait for the Python response while pumping request-body chunks into
+%% the buffer. Runs as a stream_deferred resolver: returns the response
+%% decision before any header is written.
+wsgi_wait(BodyCtx, ReqInfo, TimeoutMs) ->
+    {BodyRef, Buffer} = body_ctx_ref(BodyCtx),
+    receive
+        {livery_body, BodyRef, {data, Chunk}} ->
+            _ = py_buffer:write(Buffer, Chunk),
+            wsgi_wait(BodyCtx, ReqInfo, TimeoutMs);
+        {livery_body, BodyRef, _EofOrError} ->
+            %% eof/trailers/reset/error all complete the buffer; a reset
+            %% surfaces to Python as EOF on the body stream
+            _ = py_buffer:close(Buffer),
+            wsgi_wait(done, ReqInfo, TimeoutMs);
+        {<<"start_response">>, StatusCode, Headers} ->
+            %% Streaming response - filter hop-by-hop and start streaming
+            SafeHeaders = convert_headers(filter_hop_by_hop(Headers)),
+            {stream, parse_status_code(StatusCode), SafeHeaders,
+             fun(Emit) -> wsgi_stream_loop(Emit, BodyCtx, TimeoutMs) end};
+        {<<"response">>, StatusCode, Headers, Body} ->
+            %% Complete response
+            SafeHeaders = filter_hop_by_hop(Headers),
+            Response = #{
+                <<"status">> => StatusCode,
+                <<"headers">> => SafeHeaders,
+                <<"body">> => Body
+            },
+            Response1 = hornbeam_http_hooks:run_on_response(Response),
+            close_body(BodyCtx),
+            {full,
+             parse_status_code(maps:get(<<"status">>, Response1)),
+             convert_headers(maps:get(<<"headers">>, Response1)),
+             maps:get(<<"body">>, Response1)};
+        {<<"error">>, Reason} ->
+            close_body(BodyCtx),
+            error_decision(Reason, ReqInfo)
+    after TimeoutMs ->
+        close_body(BodyCtx),
+        error_decision(timeout, ReqInfo)
     end.
 
 %% @private
-%% Build environ dict for NIF optimization.
-%% Uses binary keys which the NIF optimizes with interned strings.
-%% State may contain script_name and path_info from mount lookup.
-build_environ_for_nif(Req, State) ->
-    Method = cowboy_req:method(Req),
-    Path = cowboy_req:path(Req),
-    Qs = cowboy_req:qs(Req),
-    Headers = cowboy_req:headers(Req),
-    Host = cowboy_req:host(Req),
-    Port = cowboy_req:port(Req),
-    Scheme = cowboy_req:scheme(Req),
-    Version = cowboy_req:version(Req),
-    {ClientIp, _ClientPort} = cowboy_req:peer(Req),
-
-    %% Get SCRIPT_NAME and PATH_INFO from state (multi-app) or defaults
-    ScriptName = maps:get(script_name, State, <<>>),
-    PathInfo = maps:get(path_info, State, Path),
-
-    %% Read body
-    {ok, Body, _Req2} = cowboy_req:read_body(Req),
-
-    %% Build HTTP_* headers
-    HttpHeaders = maps:fold(fun(Name, Value, Acc) ->
-        HeaderKey = header_to_wsgi_key(Name),
-        Acc#{HeaderKey => Value}
-    end, #{}, Headers),
-
-    %% Build base environ
-    BaseEnviron = #{
-        <<"REQUEST_METHOD">> => Method,
-        <<"SCRIPT_NAME">> => ScriptName,
-        <<"PATH_INFO">> => PathInfo,
-        <<"QUERY_STRING">> => Qs,
-        <<"SERVER_NAME">> => Host,
-        <<"SERVER_PORT">> => integer_to_binary(Port),
-        <<"SERVER_PROTOCOL">> => format_protocol(Version),
-        <<"REMOTE_ADDR">> => format_ip(ClientIp),
-        <<"wsgi.version">> => {1, 0},
-        <<"wsgi.url_scheme">> => Scheme,
-        <<"wsgi.input">> => Body,
-        <<"wsgi.multithread">> => true,
-        <<"wsgi.multiprocess">> => true,
-        <<"wsgi.run_once">> => false
-    },
-
-    %% Merge HTTP headers
-    Environ1 = maps:merge(BaseEnviron, HttpHeaders),
-
-    %% Add CONTENT_TYPE and CONTENT_LENGTH if present
-    ContentType = maps:get(<<"content-type">>, Headers, undefined),
-    ContentLength = maps:get(<<"content-length">>, Headers, undefined),
-    Environ2 = case ContentType of
-        undefined -> Environ1;
-        CT -> Environ1#{<<"CONTENT_TYPE">> => CT}
-    end,
-    case ContentLength of
-        undefined -> Environ2;
-        CL -> Environ2#{<<"CONTENT_LENGTH">> => CL}
+%% Receive and stream response chunks to the client while still pumping
+%% any remaining request-body chunks into the buffer
+wsgi_stream_loop(Emit, BodyCtx, TimeoutMs) ->
+    {BodyRef, Buffer} = body_ctx_ref(BodyCtx),
+    receive
+        {livery_body, BodyRef, {data, Chunk}} ->
+            _ = py_buffer:write(Buffer, Chunk),
+            wsgi_stream_loop(Emit, BodyCtx, TimeoutMs);
+        {livery_body, BodyRef, _EofOrError} ->
+            _ = py_buffer:close(Buffer),
+            wsgi_stream_loop(Emit, done, TimeoutMs);
+        {<<"chunk">>, Chunk} ->
+            case Emit(Chunk) of
+                ok ->
+                    wsgi_stream_loop(Emit, BodyCtx, TimeoutMs);
+                {error, _} ->
+                    %% The stream takes no more data: the client is gone, or
+                    %% it rejects a body outright - an h2/h3 response to HEAD
+                    %% answers `{error, invalid_stream_state}' where HTTP/1.1
+                    %% just swallows the bytes. Unblock Python's body reads
+                    %% and stop either way.
+                    close_body(BodyCtx),
+                    {error, closed}
+            end;
+        <<"done">> ->
+            close_body(BodyCtx),
+            ok;
+        {<<"error">>, _Reason} ->
+            close_body(BodyCtx),
+            ok
+    after TimeoutMs ->
+        close_body(BodyCtx),
+        ok
     end.
 
 %% @private
-header_to_wsgi_key(Name) ->
-    %% Convert header name to WSGI HTTP_* format
-    %% e.g., "content-type" -> "CONTENT_TYPE" (but CONTENT_TYPE is special)
-    %% "accept" -> "HTTP_ACCEPT"
-    case Name of
-        <<"content-type">> -> <<"CONTENT_TYPE">>;
-        <<"content-length">> -> <<"CONTENT_LENGTH">>;
-        _ ->
-            Upper = string:uppercase(Name),
-            Underscored = binary:replace(Upper, <<"-">>, <<"_">>, [global]),
-            <<"HTTP_", Underscored/binary>>
-    end.
+body_ctx_ref({streaming, Ref, Buffer}) -> {Ref, Buffer};
+body_ctx_ref(done) -> {make_ref(), undefined}.
 
 %% @private
-format_protocol('HTTP/1.0') -> <<"HTTP/1.0">>;
-format_protocol('HTTP/1.1') -> <<"HTTP/1.1">>;
-format_protocol('HTTP/2') -> <<"HTTP/2">>.
+%% Filter hop-by-hop headers from response
+filter_hop_by_hop(Headers) ->
+    lists:filter(fun(Header) ->
+        Name = case Header of
+            [N, _] -> N;
+            {N, _} -> N
+        end,
+        LowerName = string:lowercase(to_binary(Name)),
+        not lists:member(LowerName, ?HOP_BY_HOP_HEADERS)
+    end, Headers).
 
-send_wsgi_response(Req, Response, State) ->
-    Status = maps:get(<<"status">>, Response),
-    Headers = maps:get(<<"headers">>, Response),
-    Body = maps:get(<<"body">>, Response),
-    EarlyHints = maps:get(<<"early_hints">>, Response, []),
-
-    %% Parse status code
-    StatusCode = parse_status_code(Status),
-
-    %% Convert headers to cowboy format
-    CowboyHeaders = convert_headers(Headers),
-
-    %% Send early hints if any (103 responses)
-    Req1 = send_early_hints(Req, EarlyHints),
-
-    %% Send response
-    Req2 = cowboy_req:reply(StatusCode, CowboyHeaders, Body, Req1),
-    {ok, Req2, State}.
+%%% ============================================================================
+%%% Error handling
+%%% ============================================================================
 
 %% @private
-%% Send WSGI response with profiling
-send_wsgi_response_profiled(Req, Response, State, Prof) ->
-    Status = maps:get(<<"status">>, Response),
-    Headers = maps:get(<<"headers">>, Response),
-    Body = maps:get(<<"body">>, Response),
-    EarlyHints = maps:get(<<"early_hints">>, Response, []),
-    StatusCode = parse_status_code(Status),
-    CowboyHeaders = convert_headers(Headers),
-    Req1 = send_early_hints(Req, EarlyHints),
-    Req2 = cowboy_req:reply(StatusCode, CowboyHeaders, Body, Req1),
-    hornbeam_profiler:end_request(Prof),
-    {ok, Req2, State}.
+%% Full error response as a livery_resp (pre-stream errors)
+error_resp(Error, ReqInfo) ->
+    {full, StatusCode, Headers, Body} = error_decision(Error, ReqInfo),
+    livery_resp:new(StatusCode, Headers, {full, Body}).
+
+%% @doc Error response as a stream_deferred decision.
+error_decision(Error, ReqInfo) ->
+    {StatusCode, Body} = hornbeam_http_hooks:run_on_error(Error, ReqInfo),
+    {full, StatusCode, [{<<"content-type">>, <<"text/plain">>}], Body}.
+
+%% @doc Request info map passed to HTTP hooks.
+build_request_info(Req, State) ->
+    {Host, Port} = hornbeam_request:server_info(Req, State),
+    #{
+        method => livery_req:method(Req),
+        path => livery_req:path(Req),
+        query_string => livery_req:query(Req),
+        headers => headers_map(livery_req:headers(Req)),
+        host => Host,
+        port => Port,
+        scheme => hornbeam_request:scheme(State),
+        peer => livery_req:peer(Req)
+    }.
 
 %% @private
-send_early_hints(Req, []) ->
-    Req;
-send_early_hints(Req, [Hints | Rest]) ->
-    %% Convert hints to cowboy headers format
-    HintHeaders = convert_headers(Hints),
-    %% Send 103 Early Hints informational response
-    Req1 = cowboy_req:inform(103, HintHeaders, Req),
-    send_early_hints(Req1, Rest).
+%% Hooks historically saw headers as a lowercase-keyed map; join
+%% duplicates with ", " to preserve every value.
+headers_map(Headers) ->
+    lists:foldl(fun({Name, Value}, Acc) ->
+        case Acc of
+            #{Name := Prev} -> Acc#{Name := <<Prev/binary, ", ", Value/binary>>};
+            _ -> Acc#{Name => Value}
+        end
+    end, #{}, Headers).
+
+%%% ============================================================================
+%%% Utilities
+%%% ============================================================================
+
+%% @doc Convert Python response headers ([[Name, Value], ...] or
+%% [{Name, Value}, ...]) to livery's list shape, lowercasing names and
+%% preserving duplicates.
+convert_headers(Headers) ->
+    lists:filtermap(fun(Header) ->
+        case Header of
+            [Name, Value] ->
+                {true, {to_lower_binary(Name), to_binary(Value)}};
+            {Name, Value} ->
+                {true, {to_lower_binary(Name), to_binary(Value)}};
+            _ ->
+                false
+        end
+    end, Headers).
 
 parse_status_code(Status) when is_binary(Status) ->
     case binary:split(Status, <<" ">>) of
@@ -345,360 +401,6 @@ parse_status_code(Status) when is_list(Status) ->
 parse_status_code(Status) when is_integer(Status) ->
     Status.
 
-%%% ============================================================================
-%%% ASGI Handler
-%%% ============================================================================
-
-handle_asgi(Req, State) ->
-    %% Start profiling if enabled
-    Prof0 = hornbeam_profiler:start_request(),
-
-    %% Build initial request map for hooks (measures cowboy parsing overhead)
-    ReqInfo = build_request_info(Req),
-    Prof1 = hornbeam_profiler:mark(cowboy_parse, Prof0),
-
-    %% Run on_request hook
-    ReqInfo1 = hornbeam_http_hooks:run_on_request(ReqInfo),
-    Prof2 = hornbeam_profiler:mark(hooks_request, Prof1),
-
-    try
-        %% Get app module and callable from cached state (avoids ETS lookups)
-        AppModule = maps:get(app_module, State),
-        AppCallable = maps:get(app_callable, State),
-        TimeoutMs = maps:get(timeout, State, 30000),
-
-        %% Read request body
-        {ok, ReqBody, Req2} = cowboy_req:read_body(Req),
-        Prof3 = hornbeam_profiler:mark(body_read, Prof2),
-
-        %% Determine ASGI execution mode:
-        %% - context_affinity: Use lifespan context (for shared module state)
-        %% - bind_context: Bind a fresh context per-request (reduces GIL overhead)
-        %% - default: Use optimized NIF path (fastest for simple apps)
-        UseContextAffinity = maps:get(context_affinity, State, false),
-        BindContext = maps:get(bind_context, State, false),
-
-        Result = case {UseContextAffinity, BindContext} of
-            {true, _} ->
-                %% Context affinity path - uses same worker as lifespan
-                %% Required when app stores resources in module-level variables
-                PyContext = hornbeam_lifespan:get_context(),
-                run_asgi_with_context_profiled(Req, AppModule, AppCallable, ReqBody, PyContext, TimeoutMs, State, Prof3);
-            {false, true} ->
-                %% Bound context path - binds worker for request duration
-                %% Better for apps with multiple async operations
-                run_asgi_bound_profiled(Req, AppModule, AppCallable, ReqBody, TimeoutMs, State, Prof3);
-            {false, false} ->
-                %% Optimized py_asgi:run/5 path (NIF-based marshalling)
-                %% Best for simple request/response apps
-                run_asgi_optimized_profiled(Req, AppModule, AppCallable, ReqBody, State, Prof3)
-        end,
-
-        case Result of
-            {ok, Response, Prof4} ->
-                %% Run on_response hook
-                Response1 = hornbeam_http_hooks:run_on_response(Response),
-                Prof5 = hornbeam_profiler:mark(hooks_response, Prof4),
-                send_asgi_response_profiled(Req2, Response1, State, Prof5);
-            {error, {overloaded, Current, Max}} ->
-                hornbeam_profiler:end_request(Prof3),
-                overload_response(Req2, Current, Max, State);
-            {error, Error} ->
-                hornbeam_profiler:end_request(Prof3),
-                handle_error(Req2, Error, ReqInfo1, State)
-        end
-    catch
-        Class:Reason:Stack ->
-            hornbeam_profiler:end_request(Prof2),
-            error_logger:error_msg("ASGI handler error: ~p:~p~n~p~n",
-                                   [Class, Reason, Stack]),
-            handle_error(Req, {Class, Reason}, ReqInfo1, State)
-    end.
-
-%% @private
-%% Optimized path using py_asgi:run/5 with NIF marshalling
-%% Now routes through worker pool for better concurrency
-run_asgi_optimized(Req, AppModule, AppCallable, ReqBody, State) ->
-    Scope = build_scope_for_nif(Req, State),
-    %% Use worker pool for better GIL handling under high concurrency
-    case py_worker_pool:asgi_run(AppModule, AppCallable, Scope, ReqBody,
-                                  #{runner => <<"hornbeam_asgi_runner">>}) of
-        {ok, {Status, Headers, Body}} ->
-            {ok, #{<<"status">> => Status,
-                   <<"headers">> => Headers,
-                   <<"body">> => Body}};
-        {error, _} = Error ->
-            Error
-    end.
-
-%% @private
-%% Optimized path with profiling - uses worker pool
-run_asgi_optimized_profiled(Req, AppModule, AppCallable, ReqBody, State, Prof) ->
-    Scope = build_scope_for_nif(Req, State),
-    Prof1 = hornbeam_profiler:mark(scope_build, Prof),
-    case py_worker_pool:asgi_run(AppModule, AppCallable, Scope, ReqBody,
-                                  #{runner => <<"hornbeam_asgi_runner">>}) of
-        {ok, {Status, Headers, Body}} ->
-            Prof2 = hornbeam_profiler:mark(python_exec, Prof1),
-            {ok, #{<<"status">> => Status,
-                   <<"headers">> => Headers,
-                   <<"body">> => Body}, Prof2};
-        {error, _} = Error ->
-            Error
-    end.
-
-%% @private
-%% Context-aware fallback path using py:ctx_call
-run_asgi_with_context(Req, AppModule, AppCallable, ReqBody, PyContext, TimeoutMs, State) ->
-    %% Build scope options from state (for multi-app mode)
-    ScopeOpts = case maps:get(script_name, State, undefined) of
-        undefined -> #{};
-        ScriptName -> #{root_path => ScriptName}
-    end,
-    Scope = hornbeam_asgi:build_scope(Req, ScopeOpts),
-    %% Override path if set in state (from mount lookup)
-    Scope1 = case maps:get(path_info, State, undefined) of
-        undefined -> Scope;
-        PathInfo -> Scope#{<<"path">> => PathInfo, <<"raw_path">> => PathInfo}
-    end,
-    py:ctx_call(PyContext, hornbeam_asgi_runner, run_asgi,
-               [AppModule, AppCallable, Scope1, ReqBody], #{}, TimeoutMs).
-
-%% @private
-%% Context-aware fallback path with profiling
-run_asgi_with_context_profiled(Req, AppModule, AppCallable, ReqBody, PyContext, TimeoutMs, State, Prof) ->
-    ScopeOpts = case maps:get(script_name, State, undefined) of
-        undefined -> #{};
-        ScriptName -> #{root_path => ScriptName}
-    end,
-    Scope = hornbeam_asgi:build_scope(Req, ScopeOpts),
-    Prof1 = hornbeam_profiler:mark(scope_build, Prof),
-    Scope1 = case maps:get(path_info, State, undefined) of
-        undefined -> Scope;
-        PathInfo -> Scope#{<<"path">> => PathInfo, <<"raw_path">> => PathInfo}
-    end,
-    case py:ctx_call(PyContext, hornbeam_asgi_runner, run_asgi,
-                     [AppModule, AppCallable, Scope1, ReqBody], #{}, TimeoutMs) of
-        {ok, Response} ->
-            Prof2 = hornbeam_profiler:mark(python_exec, Prof1),
-            {ok, Response, Prof2};
-        Error ->
-            Error
-    end.
-
-%% @private
-%% Bound context path - binds a worker for the request duration.
-%% This reduces overhead for apps with multiple async operations by
-%% keeping the same Python worker/GIL for the entire request.
-run_asgi_bound(Req, AppModule, AppCallable, ReqBody, TimeoutMs, State) ->
-    %% Build scope options from state (for multi-app mode)
-    ScopeOpts = case maps:get(script_name, State, undefined) of
-        undefined -> #{};
-        ScriptName -> #{root_path => ScriptName}
-    end,
-    Scope = hornbeam_asgi:build_scope(Req, ScopeOpts),
-    %% Override path if set in state (from mount lookup)
-    Scope1 = case maps:get(path_info, State, undefined) of
-        undefined -> Scope;
-        PathInfo -> Scope#{<<"path">> => PathInfo, <<"raw_path">> => PathInfo}
-    end,
-    %% Use with_context to bind a worker for the request duration
-    py:with_context(fun() ->
-        py:call(hornbeam_asgi_runner, run_asgi,
-                [AppModule, AppCallable, Scope1, ReqBody], #{}, TimeoutMs)
-    end).
-
-%% @private
-%% Bound context path with profiling
-run_asgi_bound_profiled(Req, AppModule, AppCallable, ReqBody, TimeoutMs, State, Prof) ->
-    ScopeOpts = case maps:get(script_name, State, undefined) of
-        undefined -> #{};
-        ScriptName -> #{root_path => ScriptName}
-    end,
-    Scope = hornbeam_asgi:build_scope(Req, ScopeOpts),
-    Prof1 = hornbeam_profiler:mark(scope_build, Prof),
-    Scope1 = case maps:get(path_info, State, undefined) of
-        undefined -> Scope;
-        PathInfo -> Scope#{<<"path">> => PathInfo, <<"raw_path">> => PathInfo}
-    end,
-    case py:with_context(fun() ->
-        py:call(hornbeam_asgi_runner, run_asgi,
-                [AppModule, AppCallable, Scope1, ReqBody], #{}, TimeoutMs)
-    end) of
-        {ok, Response} ->
-            Prof2 = hornbeam_profiler:mark(python_exec, Prof1),
-            {ok, Response, Prof2};
-        Error ->
-            Error
-    end.
-
-%% @private
-%% Build scope with atom keys for NIF optimization.
-%% The NIF uses asgi_get_key_for_term which optimizes atom key lookups.
-%% State may contain script_name (root_path) and path_info from mount lookup.
-build_scope_for_nif(Req, State) ->
-    Method = cowboy_req:method(Req),
-    Path = cowboy_req:path(Req),
-    Qs = cowboy_req:qs(Req),
-    Headers = cowboy_req:headers(Req),
-    Host = cowboy_req:host(Req),
-    Port = cowboy_req:port(Req),
-    Scheme = cowboy_req:scheme(Req),
-    Version = cowboy_req:version(Req),
-    {ClientIp, ClientPort} = cowboy_req:peer(Req),
-
-    %% Get root_path and path from state (multi-app) or defaults
-    RootPath = maps:get(script_name, State, <<>>),
-    ScopePath = maps:get(path_info, State, Path),
-
-    HeaderList = maps:fold(fun(Name, Value, Acc) ->
-        [[Name, Value] | Acc]
-    end, [], Headers),
-
-    LifespanState = hornbeam_lifespan:get_state(),
-
-    #{
-        type => <<"http">>,
-        asgi => #{<<"version">> => <<"3.0">>, <<"spec_version">> => <<"2.4">>},
-        http_version => format_http_version(Version),
-        method => Method,
-        scheme => Scheme,
-        path => ScopePath,
-        raw_path => ScopePath,
-        query_string => Qs,
-        root_path => RootPath,
-        headers => HeaderList,
-        server => {Host, Port},
-        client => {format_ip(ClientIp), ClientPort},
-        state => LifespanState,
-        extensions => build_extensions(Version)
-    }.
-
-%% @private
-format_http_version('HTTP/1.0') -> <<"1.0">>;
-format_http_version('HTTP/1.1') -> <<"1.1">>;
-format_http_version('HTTP/2') -> <<"2">>.
-
-%% @private
-format_ip({A, B, C, D}) ->
-    list_to_binary([
-        integer_to_list(A), $.,
-        integer_to_list(B), $.,
-        integer_to_list(C), $.,
-        integer_to_list(D)
-    ]);
-format_ip(Addr = {_, _, _, _, _, _, _, _}) ->
-    list_to_binary(inet:ntoa(Addr)).
-
-%% @private
-build_extensions('HTTP/2') ->
-    #{
-        <<"http.response.trailers">> => #{},
-        <<"http.response.early_hints">> => #{}
-    };
-build_extensions(_) ->
-    #{
-        <<"http.response.early_hints">> => #{}
-    }.
-
-send_asgi_response(Req, Response, State) ->
-    Status = maps:get(<<"status">>, Response),
-    Headers = maps:get(<<"headers">>, Response),
-    Body = maps:get(<<"body">>, Response),
-    EarlyHints = maps:get(<<"early_hints">>, Response, []),
-
-    %% Convert status
-    StatusCode = case Status of
-        undefined -> 500;
-        S when is_integer(S) -> S;
-        S -> parse_status_code(S)
-    end,
-
-    %% Convert headers to cowboy format
-    CowboyHeaders = convert_headers(Headers),
-
-    %% Send early hints if any
-    Req1 = send_early_hints(Req, EarlyHints),
-
-    Req2 = cowboy_req:reply(StatusCode, CowboyHeaders, Body, Req1),
-    {ok, Req2, State}.
-
-%% @private
-%% Send ASGI response with profiling
-send_asgi_response_profiled(Req, Response, State, Prof) ->
-    Status = maps:get(<<"status">>, Response),
-    Headers = maps:get(<<"headers">>, Response),
-    Body = maps:get(<<"body">>, Response),
-    EarlyHints = maps:get(<<"early_hints">>, Response, []),
-    StatusCode = case Status of
-        undefined -> 500;
-        S when is_integer(S) -> S;
-        S -> parse_status_code(S)
-    end,
-    CowboyHeaders = convert_headers(Headers),
-    Req1 = send_early_hints(Req, EarlyHints),
-    Req2 = cowboy_req:reply(StatusCode, CowboyHeaders, Body, Req1),
-    hornbeam_profiler:end_request(Prof),
-    {ok, Req2, State}.
-
-%%% ============================================================================
-%%% Error handling
-%%% ============================================================================
-
-%% @private
-%% Handle errors using the on_error hook if configured
-handle_error(Req, Error, ReqInfo, State) ->
-    {StatusCode, Body} = hornbeam_http_hooks:run_on_error(Error, ReqInfo),
-    Req2 = cowboy_req:reply(StatusCode,
-                            #{<<"content-type">> => <<"text/plain">>},
-                            Body,
-                            Req),
-    {ok, Req2, State}.
-
-%% @private
-%% Return 503 Service Unavailable when Python workers are overloaded
-overload_response(Req, Current, Max, State) ->
-    ErrorMsg = io_lib:format("Service temporarily unavailable: ~p/~p workers busy",
-                             [Current, Max]),
-    Req2 = cowboy_req:reply(503,
-                            #{<<"content-type">> => <<"text/plain">>,
-                              <<"retry-after">> => <<"1">>},
-                            iolist_to_binary(ErrorMsg),
-                            Req),
-    {ok, Req2, State}.
-
-%% @private
-%% Build request info map for hooks
-build_request_info(Req) ->
-    #{
-        method => cowboy_req:method(Req),
-        path => cowboy_req:path(Req),
-        query_string => cowboy_req:qs(Req),
-        headers => cowboy_req:headers(Req),
-        host => cowboy_req:host(Req),
-        port => cowboy_req:port(Req),
-        scheme => cowboy_req:scheme(Req),
-        peer => cowboy_req:peer(Req)
-    }.
-
-%%% ============================================================================
-%%% Utilities
-%%% ============================================================================
-
-%% @private
-%% Convert headers from various formats to cowboy map format
-convert_headers(Headers) ->
-    lists:foldl(fun(Header, Acc) ->
-        case Header of
-            [Name, Value] ->
-                Acc#{to_lower_binary(Name) => to_binary(Value)};
-            {Name, Value} ->
-                Acc#{to_lower_binary(Name) => to_binary(Value)};
-            _ ->
-                Acc
-        end
-    end, #{}, Headers).
-
 to_binary(V) when is_binary(V) -> V;
 to_binary(V) when is_list(V) -> list_to_binary(V);
 to_binary(V) when is_atom(V) -> atom_to_binary(V, utf8);
@@ -708,41 +410,3 @@ to_lower_binary(V) when is_binary(V) -> string:lowercase(V);
 to_lower_binary(V) when is_list(V) -> string:lowercase(list_to_binary(V));
 to_lower_binary(V) when is_atom(V) -> string:lowercase(atom_to_binary(V, utf8));
 to_lower_binary(V) -> string:lowercase(to_binary(V)).
-
-%%% ============================================================================
-%%% WebSocket callbacks (delegate to hornbeam_websocket)
-%%% ============================================================================
-
-%% @private
-%% Setup pythonpath for a mount before executing the app.
-%% This ensures mount-specific dependencies are available.
-%% Note: paths are added at startup too, but this ensures they're
-%% at the front of sys.path for this request.
-setup_mount_pythonpath(Mount) ->
-    case maps:get(pythonpath, Mount, []) of
-        [] ->
-            ok;
-        Paths when is_list(Paths) ->
-            %% Add each path to sys.path if not already present
-            lists:foreach(fun(Path) ->
-                PathBin = if
-                    is_binary(Path) -> Path;
-                    is_list(Path) -> list_to_binary(Path);
-                    true -> Path
-                end,
-                py:eval(<<"__import__('sys').path.insert(0, p) if p not in __import__('sys').path else None">>,
-                        #{p => PathBin})
-            end, Paths)
-    end.
-
-websocket_init(State) ->
-    hornbeam_websocket:websocket_init(State).
-
-websocket_handle(Frame, State) ->
-    hornbeam_websocket:websocket_handle(Frame, State).
-
-websocket_info(Info, State) ->
-    hornbeam_websocket:websocket_info(Info, State).
-
-terminate(Reason, Req, State) ->
-    hornbeam_websocket:terminate(Reason, Req, State).

@@ -12,406 +12,335 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WebSocket runner module for hornbeam.
-
-This module handles ASGI WebSocket protocol communication between
-Erlang and Python ASGI applications.
-
-Adapted from gunicorn (MIT License).
-https://github.com/benoitc/gunicorn
-"""
-
 import asyncio
 import importlib
 import os
 import sys
-from collections import deque
-from typing import Dict, Any, Optional, List
+from collections.abc import Awaitable, Callable
+from typing import Protocol
 
-# Dev reload mode: when True, evicts modules from sys.modules before import
-# Set HORNBEAM_DEV_RELOAD=1 to enable (for hot-reload during development)
-_DEV_RELOAD = os.environ.get('HORNBEAM_DEV_RELOAD', '').lower() in ('1', 'true', 'yes')
+import erlang
 
+Message = dict[str, object]
+Receive = Callable[[], Awaitable[Message]]
+Send = Callable[[Message], Awaitable[None]]
+App = Callable[[Message, Receive, Send], Awaitable[None]]
 
-# Install erlang event loop as the default event loop policy (once per interpreter)
-def _install_erlang_loop() -> bool:
-    """Install erlang event loop as the default asyncio event loop policy."""
-    try:
-        from erlang_loop import get_event_loop_policy
-        asyncio.set_event_loop_policy(get_event_loop_policy())
-        return True
-    except (ImportError, AttributeError, RuntimeError):
-        return False
-
-
-_install_erlang_loop()
+_DEV_RELOAD = os.environ.get("HORNBEAM_DEV_RELOAD", "").lower() in ("1", "true", "yes")
+_DISCONNECT_GRACE = 1.0
+_INPUT_QUEUE_SIZE = 16
+_INPUT_BACKPRESSURE_TIMEOUT = 0.25
+_OUTPUT_TIMEOUT = 7.0
+_MAX_OUTPUT_FRAME = 16777216
+_MAX_PENDING_OUTPUT = 16
+_sessions: dict[str, "WebSocketSession"] = {}
 
 
-# Active WebSocket sessions
-# Each session stores the ASGI app instance and message queues
-_sessions: Dict[str, 'WebSocketSession'] = {}
+class NativeInput(Protocol):
+    async def async_receive(self, *, native_only: bool = False) -> object: ...
+
+    def close(self) -> None: ...
+
+
+def _text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    raise TypeError("Expected text")
+
+
+def _close_reason(value: object) -> bytes:
+    # The wire limit is 123 bytes after the two-byte status code.
+    return (
+        _text(value)[:123]
+        .encode("utf-8")[:123]
+        .decode("utf-8", "ignore")
+        .encode("utf-8")
+    )
 
 
 class WebSocketSession:
-    """Manages a single WebSocket connection session.
+    """One app invocation and its bounded, independently watched input."""
 
-    Each session maintains:
-    - The ASGI scope
-    - Message queues for send/receive
-    - The running ASGI application task
-    """
-
-    def __init__(self, scope: dict, app_module: str, app_callable: str):
-        self.scope = scope
-        self.app_module = app_module
-        self.app_callable = app_callable
-        self.app = None
-        self.task = None
-
-        # Message queues
-        self.receive_queue: asyncio.Queue = None
-        self.send_queue: deque = deque()
-
-        # Broadcast queue - messages to be published via Erlang pubsub
-        self.broadcast_queue: deque = deque()
-
-        # State
+    def __init__(
+        self, owner: object, channel: NativeInput, transport_owner: object | None = None
+    ) -> None:
+        self.owner = owner
+        self.transport_owner = owner if transport_owner is None else transport_owner
+        self.output_lock = asyncio.Lock()
+        self.pending_output = 0
+        self.output_aborted = False
+        self.channel = channel
+        self.incoming: asyncio.Queue[Message] = asyncio.Queue(_INPUT_QUEUE_SIZE)
         self.accepted = False
         self.closed = False
-        self.close_code: Optional[int] = None
+        self.disconnected = False
+        self.disconnect_code = 1006
+        self.close_sent = asyncio.Event()
 
-        # Event loop for this session
-        self.loop = None
+    def emit(self, message: object) -> None:
+        erlang.send(self.owner, message)
 
-        # Event signaled when output is ready (replaces polling)
-        self.output_ready: Optional[asyncio.Event] = None
+    async def abort_output(self) -> None:
+        if self.output_aborted:
+            return
+        self.output_aborted = True
+        self.closed = True
+        self.close_sent.set()
+        try:
+            async with asyncio.timeout(_OUTPUT_TIMEOUT):
+                await erlang.async_call(
+                    "hornbeam_ws_output", self.transport_owner, self.owner, b"abort"
+                )
+        except Exception:
+            pass
 
-    def load_app(self):
-        """Load the ASGI application."""
-        if _DEV_RELOAD and self.app_module in sys.modules:
-            del sys.modules[self.app_module]
-        module = importlib.import_module(self.app_module)
-        self.app = getattr(module, self.app_callable)
+    async def output(self, message: object, *, closing: bool = False) -> None:
+        try:
+            async with asyncio.timeout(_OUTPUT_TIMEOUT):
+                result = await erlang.async_call(
+                    "hornbeam_ws_output", self.transport_owner, self.owner, message
+                )
+            if result != 1 or self.disconnected or (self.closed and not closing):
+                raise OSError("WebSocket transport is closed")
+        except Exception as error:
+            await self.abort_output()
+            raise OSError("WebSocket output failed") from error
 
-    async def receive(self) -> dict:
-        """ASGI receive callable."""
-        return await self.receive_queue.get()
+    def signal_disconnect(self, code: int) -> None:
+        self.disconnected = True
+        self.disconnect_code = code
+        # Pending data is no longer useful once the peer is gone. Leave a
+        # disconnect to wake an app that is currently blocked in receive().
+        while not self.incoming.empty():
+            self.incoming.get_nowait()
+        self.incoming.put_nowait({"type": "websocket.disconnect", "code": code})
 
-    async def send(self, message: dict) -> None:
-        """ASGI send callable."""
-        msg_type = message.get('type', '')
+    async def receive(self) -> Message:
+        if self.disconnected:
+            return {"type": "websocket.disconnect", "code": self.disconnect_code}
+        return await self.incoming.get()
 
-        if msg_type == 'websocket.accept':
+    async def send(self, message: Message) -> None:
+        if self.closed or self.disconnected:
+            raise OSError("WebSocket connection is closed")
+        if self.pending_output >= _MAX_PENDING_OUTPUT:
+            await self.abort_output()
+            raise OSError("WebSocket pending output limit exceeded")
+        for field in ("text", "bytes", "subprotocol"):
+            value = message.get(field)
+            if isinstance(value, (str, bytes)) and len(value) > _MAX_OUTPUT_FRAME:
+                await self.abort_output()
+                raise OSError("WebSocket output frame limit exceeded")
+        self.pending_output += 1
+        try:
+            async with self.output_lock:
+                await self.send_message(message)
+        except asyncio.CancelledError:
+            await self.abort_output()
+            raise
+        finally:
+            self.pending_output -= 1
+
+    async def send_message(self, message: Message) -> None:
+        if self.closed or self.disconnected:
+            raise OSError("WebSocket connection is closed")
+        kind = message.get("type")
+        if kind == "websocket.accept":
+            if self.accepted:
+                raise RuntimeError("WebSocket already accepted")
+            subprotocol = message.get("subprotocol")
+            await self.output(
+                (
+                    b"websocket_accept",
+                    b"" if subprotocol is None else _text(subprotocol).encode("utf-8"),
+                )
+            )
             self.accepted = True
-            self.send_queue.append(message)
-            self._signal_output_ready()
-
-        elif msg_type == 'websocket.send':
+        elif kind == "websocket.send":
             if not self.accepted:
                 raise RuntimeError("Cannot send before accepting connection")
-            self.send_queue.append(message)
-            self._signal_output_ready()
+            text = message.get("text")
+            data = message.get("bytes")
+            if text is not None and data is None:
+                text = _text(text)
+                if len(text) > _MAX_OUTPUT_FRAME:
+                    await self.abort_output()
+                    raise OSError("WebSocket output frame limit exceeded")
+                payload = text.encode("utf-8")
+                frame_kind = b"text"
+            elif isinstance(data, bytes) and text is None:
+                payload = data
+                frame_kind = b"binary"
+            else:
+                raise TypeError("websocket.send requires exactly one of text or bytes")
+            if len(payload) > _MAX_OUTPUT_FRAME:
+                await self.abort_output()
+                raise OSError("WebSocket output frame limit exceeded")
+            await self.output((b"websocket_send", frame_kind, payload))
+        elif kind == "websocket.close":
+            code = message.get("code", 1000)
+            if not isinstance(code, int):
+                raise TypeError("WebSocket close code must be an integer")
+            await self.close(code, _close_reason(message.get("reason", "")))
+        else:
+            error = "Unsupported WebSocket ASGI message: {!r}".format(kind)
+            raise RuntimeError(error)
 
-        elif msg_type == 'websocket.close':
-            self.closed = True
-            self.close_code = message.get('code', 1000)
-            self.send_queue.append(message)
-            self._signal_output_ready()
+    async def close(self, code: int, reason: bytes = b"") -> None:
+        if self.closed or self.disconnected:
+            return
+        self.closed = True
+        try:
+            await self.output((b"websocket_close", code, reason), closing=True)
+        finally:
+            self.close_sent.set()
 
-        elif msg_type == 'websocket.http.response.start':
-            # Denial response - reject with HTTP response
-            self.send_queue.append(message)
-            self._signal_output_ready()
-
-        elif msg_type == 'websocket.http.response.body':
-            # Denial response body
-            self.send_queue.append(message)
-            self._signal_output_ready()
-
-    def _signal_output_ready(self):
-        """Signal that output is ready for collection."""
-        if self.output_ready is not None:
-            self.output_ready.set()
-
-    def collect_messages(self) -> List[dict]:
-        """Collect all pending messages to send to Erlang."""
-        messages = list(self.send_queue)
-        self.send_queue.clear()
-        # Include any broadcast requests
-        for broadcast in self.broadcast_queue:
-            messages.append({
-                'type': 'hornbeam.broadcast',
-                'topic': broadcast['topic'],
-                'message': broadcast['message']
-            })
-        self.broadcast_queue.clear()
-        return messages
-
-    def add_broadcast(self, topic: str, message: Any) -> None:
-        """Queue a broadcast to be sent via Erlang pubsub."""
-        self.broadcast_queue.append({'topic': topic, 'message': message})
-
-
-def _get_or_create_loop():
-    """Get or create an event loop."""
-    try:
-        return asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.new_event_loop()
-
-
-async def _run_app_until_response(session: WebSocketSession, event: dict) -> List[dict]:
-    """Run the ASGI app until it produces a response."""
-    # Import SuspensionRequired to avoid catching it
-    try:
-        from erlang import SuspensionRequired
-    except ImportError:
-        SuspensionRequired = None
-
-    # Add event to receive queue
-    await session.receive_queue.put(event)
-
-    # Initialize output_ready event if not set
-    if session.output_ready is None:
-        session.output_ready = asyncio.Event()
-    else:
-        session.output_ready.clear()
-
-    # If app task isn't running, start it
-    if session.task is None or session.task.done():
-        session.task = asyncio.create_task(
-            session.app(session.scope, session.receive, session.send)
-        )
-
-    # Wait for output using event-driven wakeup (replaces polling)
-    try:
-        # Create a waiter for the output_ready event
-        async def wait_for_output():
-            await session.output_ready.wait()
-
-        output_waiter = asyncio.create_task(wait_for_output())
-
-        # Wait for either output ready or task completion
-        done, pending = await asyncio.wait(
-            [output_waiter, session.task],
-            timeout=0.1,  # 100ms max wait
-            return_when=asyncio.FIRST_COMPLETED
-        )
-
-        # Cancel pending waiters
-        for task in pending:
-            if task is output_waiter:
-                task.cancel()
+    async def pump_input(self) -> None:
+        """Observe disconnect even when the app never calls receive again."""
+        try:
+            while True:
+                event = await self.channel.async_receive(native_only=True)
+                if not isinstance(event, tuple) or len(event) != 2:
+                    raise TypeError("Invalid WebSocket input event")
+                kind, data = event
+                if kind in (b"disconnect", "disconnect"):
+                    if not isinstance(data, int):
+                        raise TypeError("Invalid disconnect code")
+                    self.signal_disconnect(data)
+                    return
+                if not isinstance(data, bytes):
+                    raise TypeError("WebSocket frame must use forced bytes")
+                message: Message
+                if kind in (b"text", "text"):
+                    message = {
+                        "type": "websocket.receive",
+                        "text": data.decode("utf-8"),
+                    }
+                elif kind in (b"binary", "binary"):
+                    message = {"type": "websocket.receive", "bytes": data}
+                else:
+                    raise TypeError("Unknown WebSocket input event")
                 try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                    # A native receive can complete synchronously for an entire
+                    # burst. Yield to the app and apply bounded backpressure
+                    # rather than rejecting its seventeenth ready frame.
+                    async with asyncio.timeout(_INPUT_BACKPRESSURE_TIMEOUT):
+                        await self.incoming.put(message)
+                    await asyncio.sleep(0)
+                except TimeoutError:
+                    await self.send(
+                        {
+                            "type": "websocket.close",
+                            "code": 1013,
+                            "reason": "Application input queue full",
+                        }
+                    )
+                    self.signal_disconnect(1013)
+                    return
+        except erlang.ChannelClosed:
+            self.signal_disconnect(1006)
 
-        # Check if task raised an exception
-        if session.task in done:
-            try:
-                session.task.result()
-            except BaseException as e:
-                # Re-raise SuspensionRequired
-                if SuspensionRequired and isinstance(e, SuspensionRequired):
-                    raise
-                return [{'type': 'websocket.close', 'code': 1011,
-                        'reason': str(e)[:125]}]
+    async def run(self, app: App, scope: Message) -> None:
+        self.incoming.put_nowait({"type": "websocket.connect"})
 
-    except BaseException as e:
-        # Re-raise SuspensionRequired
-        if SuspensionRequired and isinstance(e, SuspensionRequired):
-            raise
-        return [{'type': 'websocket.close', 'code': 1011, 'reason': str(e)[:125]}]
+        # All children are retained, cancelled and awaited before this task
+        # returns. No finished app is ever invoked a second time.
+        async def invoke_app() -> None:
+            await app(scope, self.receive, self.send)
 
-    return session.collect_messages()
+        app_task = asyncio.create_task(invoke_app())
+        input_task = asyncio.create_task(self.pump_input())
+        close_task = asyncio.create_task(self.close_sent.wait())
+        tasks = (app_task, input_task, close_task)
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if input_task in done:
+                input_task.result()
+            if input_task in done or close_task in done:
+                # Application close can race an awaited finally block. Allow
+                # cooperative completion before cancelling an unresponsive app.
+                await asyncio.wait((app_task,), timeout=_DISCONNECT_GRACE)
+            if app_task.done():
+                app_task.result()
+                if not self.closed and not self.disconnected:
+                    await self.send(
+                        {
+                            "type": "websocket.close",
+                            "code": 1000 if self.accepted else 1011,
+                        }
+                    )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Await each child even if another child failed during cleanup.
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def start_session(app_module: str, app_callable: str,
-                  scope: dict, session_id: str) -> dict:
-    """Start a new WebSocket session.
-
-    Called by Erlang when a WebSocket upgrade is detected.
-    Returns the initial response (accept/close/deny).
-
-    Args:
-        app_module: Python module containing the ASGI app
-        app_callable: Name of the ASGI callable
-        scope: ASGI WebSocket scope
-        session_id: Unique session identifier
-
-    Returns:
-        Initial response message (websocket.accept or websocket.close)
-    """
-    # Add session_id to scope so the app can access it for pubsub
-    scope['session_id'] = session_id
-
-    # Create session
-    session = WebSocketSession(scope, app_module, app_callable)
-
-    # Load the app
-    session.load_app()
-
-    # Create event loop for this session
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    session.loop = loop
-    session.receive_queue = asyncio.Queue()
-
-    # Store session
+async def handle_websocket(
+    owner: object,
+    app_module: str,
+    app_callable: str,
+    scope: Message,
+    session_id: str,
+    input_ref: object,
+    output_owner: object | None = None,
+) -> bytes:
+    """Entry point submitted once by hornbeam_ws_handler via submit_task."""
+    app_module = _text(app_module)
+    app_callable = _text(app_callable)
+    session_id = _text(session_id)
+    session = WebSocketSession(
+        owner if output_owner is None else output_owner,
+        erlang.Channel(input_ref),
+        owner,
+    )
     _sessions[session_id] = session
-
-    # Import SuspensionRequired to avoid catching it
+    scope["session_id"] = session_id
     try:
-        from erlang import SuspensionRequired
-    except ImportError:
-        SuspensionRequired = None
-
-    # Send connect event and get response
-    connect_event = {'type': 'websocket.connect'}
-
-    try:
-        responses = loop.run_until_complete(
-            _run_app_until_response(session, connect_event)
-        )
-    except BaseException as e:
-        # Re-raise SuspensionRequired
-        if SuspensionRequired and isinstance(e, SuspensionRequired):
-            raise
-        # Clean up on error
-        del _sessions[session_id]
-        loop.close()
-        return {'type': 'websocket.close', 'code': 1011, 'reason': str(e)[:125]}
-
-    # Return first response (should be accept or close)
-    if responses:
-        return responses[0]
-    else:
-        # No response - default to close
-        del _sessions[session_id]
-        loop.close()
-        return {'type': 'websocket.close', 'code': 1002,
-                'reason': 'No response from application'}
-
-
-def receive_message(app_module: str, app_callable: str,
-                    session_id: str, msg_type: str, data: bytes) -> List[dict]:
-    """Handle a received WebSocket message.
-
-    Called by Erlang when a text or binary frame is received.
-
-    Args:
-        app_module: Python module (for reference)
-        app_callable: ASGI callable name (for reference)
-        session_id: Session identifier
-        msg_type: 'text' or 'bytes'
-        data: Message data
-
-    Returns:
-        List of response messages to send back
-    """
-    session = _sessions.get(session_id)
-    if session is None:
-        return [{'type': 'websocket.close', 'code': 1002,
-                'reason': 'Session not found'}]
-
-    # Build receive event
-    if msg_type == 'text':
-        if isinstance(data, bytes):
-            data = data.decode('utf-8', errors='replace')
-        event = {'type': 'websocket.receive', 'text': data}
-    else:
-        if isinstance(data, str):
-            data = data.encode('utf-8')
-        event = {'type': 'websocket.receive', 'bytes': data}
-
-    # Import SuspensionRequired to avoid catching it
-    try:
-        from erlang import SuspensionRequired
-    except ImportError:
-        SuspensionRequired = None
-
-    # Run app with this event
-    try:
-        asyncio.set_event_loop(session.loop)
-        responses = session.loop.run_until_complete(
-            _run_app_until_response(session, event)
-        )
-        return responses if responses else []
-    except BaseException as e:
-        # Re-raise SuspensionRequired
-        if SuspensionRequired and isinstance(e, SuspensionRequired):
-            raise
-        return [{'type': 'websocket.close', 'code': 1011, 'reason': str(e)[:125]}]
-
-
-def disconnect(app_module: str, app_callable: str,
-               session_id: str, code: int) -> None:
-    """Handle WebSocket disconnection.
-
-    Called by Erlang when the WebSocket connection is closed.
-
-    Args:
-        app_module: Python module (for reference)
-        app_callable: ASGI callable name (for reference)
-        session_id: Session identifier
-        code: Close code
-    """
-    session = _sessions.pop(session_id, None)
-    if session is None:
-        return
-
-    # Send disconnect event to app
-    disconnect_event = {'type': 'websocket.disconnect', 'code': code}
-
-    try:
-        asyncio.set_event_loop(session.loop)
-        session.loop.run_until_complete(
-            _run_app_until_response(session, disconnect_event)
-        )
+        extensions = scope.setdefault("extensions", {})
+        if not isinstance(extensions, dict):
+            raise TypeError("scope extensions must be a map")
+        extensions["hornbeam.owner"] = owner
+        if _DEV_RELOAD and app_module in sys.modules:
+            del sys.modules[app_module]
+        module = importlib.import_module(app_module)
+        app = module.__dict__[app_callable]
+        await session.run(app, scope)
+    except asyncio.CancelledError:
+        session.signal_disconnect(1006)
+        raise
     except Exception:
-        pass  # Ignore errors during disconnect
+        # Do not leak exception details (possibly containing secrets) on wire.
+        if not session.closed and not session.disconnected:
+            await session.send(
+                {
+                    "type": "websocket.close",
+                    "code": 1011,
+                    "reason": "Application error",
+                }
+            )
+        raise
     finally:
-        # Clean up
-        if session.task and not session.task.done():
-            session.task.cancel()
-            try:
-                session.loop.run_until_complete(session.task)
-            except asyncio.CancelledError:
-                pass
-        session.loop.close()
+        session.channel.close()
+        _sessions.pop(session_id, None)
+    return b"done"
 
 
 def get_session_count() -> int:
-    """Get the number of active WebSocket sessions."""
     return len(_sessions)
 
 
-def get_session_ids() -> List[str]:
-    """Get all active session IDs."""
-    return list(_sessions.keys())
+def get_session_ids() -> list[str]:
+    return list(_sessions)
 
 
-# =============================================================================
-# Broadcast API - queue messages for Erlang to publish after py:call returns
-# =============================================================================
-
-def broadcast(session_id: str, topic: str, message: Any) -> bool:
-    """Queue a message to be broadcast via Erlang pubsub.
-
-    This function queues the message to be published after the current
-    py:call returns to Erlang. This avoids nested Erlang calls.
-
-    Args:
-        session_id: The WebSocket session ID
-        topic: Topic name to publish to
-        message: Message to publish (will be JSON encoded and sent as text frame)
-
-    Returns:
-        True if queued successfully, False if session not found
-    """
-    session = _sessions.get(session_id)
-    if session is None:
+def broadcast(session_id: str, topic: str, message: object) -> bool:
+    """Preserve the legacy broadcast API without buffering until input arrives."""
+    session = _sessions.get(_text(session_id))
+    if session is None or session.closed or session.disconnected:
         return False
-    session.add_broadcast(topic, message)
+    session.emit((b"websocket_broadcast", topic, message))
     return True

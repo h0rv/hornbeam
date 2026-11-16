@@ -13,7 +13,7 @@ This document covers all Hornbeam configuration options.
 ```erlang
 %% Single application
 hornbeam:start("myapp:application", #{
-    bind => "0.0.0.0:8000",
+    bind => "0.0.0.0:8642",
     workers => 4,
     worker_class => asgi
 }).
@@ -24,7 +24,7 @@ hornbeam:start(#{
         {"/api", "api:app", #{worker_class => asgi}},
         {"/", "frontend:app", #{worker_class => wsgi}}
     ],
-    bind => "0.0.0.0:8000"
+    bind => "0.0.0.0:8642"
 }).
 ```
 
@@ -50,8 +50,9 @@ Each mount is a tuple: `{Prefix, AppSpec, Options}`
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `worker_class` | atom | `wsgi` | Protocol: `wsgi` or `asgi` |
-| `workers` | integer | `4` | Number of Python workers for this mount |
 | `timeout` | integer | `30000` | Request timeout in ms |
+
+> **Note:** All mounts share the global `py_context_router` pool. Configure pool size at the application level.
 
 ### Multi-App Example
 
@@ -60,12 +61,10 @@ hornbeam:start(#{
     mounts => [
         {"/api/v2", "api_v2:app", #{
             worker_class => asgi,
-            workers => 8,
             timeout => 60000
         }},
         {"/api/v1", "api_v1:app", #{
-            worker_class => wsgi,
-            workers => 4
+            worker_class => wsgi
         }},
         {"/", "frontend:app", #{worker_class => wsgi}}
     ],
@@ -73,7 +72,7 @@ hornbeam:start(#{
         {"/health", health_handler, #{}},
         {"/metrics", metrics_handler, #{}}
     ],
-    bind => "0.0.0.0:8000",
+    bind => "0.0.0.0:8642",
     pythonpath => [".", "apps"]
 }).
 ```
@@ -84,11 +83,12 @@ See [Multi-App Guide](/docs/guides/multi-app) for detailed usage.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `bind` | binary/string | `"127.0.0.1:8000"` | Address and port to bind to |
+| `bind` | binary/string | `"127.0.0.1:8642"` | Address and port to bind to |
 | `ssl` | boolean | `false` | Enable SSL/TLS |
-| `certfile` | binary | `undefined` | Path to SSL certificate |
-| `keyfile` | binary | `undefined` | Path to SSL private key |
+| `certfile` | binary | `undefined` | Path to SSL certificate (PEM) |
+| `keyfile` | binary | `undefined` | Path to SSL private key (PEM) |
 | `cacertfile` | binary | `undefined` | Path to CA certificate |
+| `http3_port` | integer | `undefined` | UDP port for HTTP/3; defaults to the `bind` port |
 
 ### SSL Example
 
@@ -100,6 +100,43 @@ hornbeam:start("app:application", #{
     keyfile => "/path/to/key.pem"
 }).
 ```
+
+### HTTP versions
+
+`http_version` picks which protocols to serve. It defaults to
+`['HTTP/1.1']`. `'HTTP/2'` and `'HTTP/3'` exist only over TLS, so both
+require `ssl => true`; asking for either without it fails at startup with
+`{error, {http_version_requires_ssl, Version}}` rather than silently
+serving HTTP/1.1.
+
+```erlang
+hornbeam:start("app:application", #{
+    bind => "0.0.0.0:443",
+    ssl => true,
+    certfile => "/path/to/cert.pem",
+    keyfile => "/path/to/key.pem",
+    http_version => ['HTTP/1.1', 'HTTP/2', 'HTTP/3']
+}).
+```
+
+| Setting | What binds |
+|---------|------------|
+| `['HTTP/1.1']` | One TCP listener, cleartext or TLS depending on `ssl` |
+| `['HTTP/1.1', 'HTTP/2']` | One TLS port serving both, chosen per connection by ALPN |
+| `['HTTP/2']` | One TLS port, HTTP/2 only; a client that cannot do h2 is refused |
+| `['HTTP/3']` added | A QUIC listener on `http3_port`, advertised to HTTP/1.1 and HTTP/2 clients with `Alt-Svc` |
+
+HTTP/3 can share the `bind` port number because QUIC is UDP and the other
+listeners are TCP.
+
+`hornbeam:info/0` reports what actually bound:
+
+```erlang
+#{running => true, listeners => #{h1 => [443], h2 => [443], h3 => [443]}}
+```
+
+Each protocol maps to a list of ports, since one port can serve two
+protocols and one protocol can appear on more than one port.
 
 ## Protocol Options
 
@@ -159,6 +196,10 @@ hornbeam:start("app:app", #{
 | `max_request_line_size` | integer | `4094` | Max HTTP request line length |
 | `max_header_size` | integer | `8190` | Max HTTP header value length |
 | `max_headers` | integer | `100` | Max number of HTTP headers |
+
+A request over the request-line limit is answered `414 URI Too Long`; one
+over either header limit is answered `431 Request Header Fields Too Large`.
+These apply to the HTTP/1.1 and ALPN listeners.
 
 ## Python Options
 
@@ -340,7 +381,7 @@ Configure via sys.config for releases:
 %% config/sys.config
 [
     {hornbeam, [
-        {bind, "0.0.0.0:8000"},
+        {bind, "0.0.0.0:8642"},
         {workers, 8},
         {worker_class, asgi},
         {timeout, 30000},
@@ -361,7 +402,7 @@ hornbeam:start("app:application").
 
 ```bash
 # Set via environment
-export HORNBEAM_BIND="0.0.0.0:8000"
+export HORNBEAM_BIND="0.0.0.0:8642"
 export HORNBEAM_WORKERS=8
 export HORNBEAM_TIMEOUT=30000
 ```
@@ -369,7 +410,7 @@ export HORNBEAM_TIMEOUT=30000
 ```erlang
 %% Read from environment
 hornbeam:start("app:application", #{
-    bind => os:getenv("HORNBEAM_BIND", "127.0.0.1:8000"),
+    bind => os:getenv("HORNBEAM_BIND", "127.0.0.1:8642"),
     workers => list_to_integer(os:getenv("HORNBEAM_WORKERS", "4"))
 }).
 ```

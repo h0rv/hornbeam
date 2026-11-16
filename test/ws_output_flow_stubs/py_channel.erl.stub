@@ -1,0 +1,5 @@
+-module(py_channel).
+-export([new/1, close/1, send/2]).
+new(_) -> {ok, {persistent_term:get(ws_output_observer), make_ref()}}.
+close({Observer, Ref}) -> Observer ! {input_closed, Ref}, ok.
+send(_, _) -> ok.

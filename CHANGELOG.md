@@ -5,6 +5,162 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`http_version` selects the protocols to serve** (default
+  `['HTTP/1.1']`). The option was documented but read by nothing; it now
+  drives which listeners bind. `'HTTP/2'` and `'HTTP/3'` exist only over
+  TLS and are refused with
+  `{error, {http_version_requires_ssl, Version}}` when `ssl` is off,
+  rather than quietly serving HTTP/1.1.
+  - `['HTTP/1.1', 'HTTP/2']` serves both from one TLS port, chosen per
+    connection by ALPN, so a client that cannot speak HTTP/2 is still
+    served rather than refused. This restores what cowboy's `start_tls`
+    did before the livery move.
+  - `'HTTP/3'` adds a QUIC listener, on the `bind` port number by
+    default or on the new `http3_port`, and advertises it to HTTP/1.1
+    and HTTP/2 clients through `Alt-Svc`. Its certificate and key are
+    converted from the configured PEM files to the DER shapes quic
+    expects.
+- `hornbeam:info/0` reports every bound protocol. Following livery
+  0.8.0, `listeners` maps each protocol to a **list** of ports, because
+  one port can serve two protocols and one protocol can be on several
+  ports.
+- **`max_request_line_size`, `max_header_size` and `max_headers` are
+  enforced.** They were accepted and documented but reached nothing. A
+  breach is now answered `414` or `431` instead of being ignored.
+
+### Fixed
+
+- **A HEAD response over HTTP/2 or HTTP/3 crashed the handler.** The
+  ASGI and WSGI producers only handled `{error, closed}` from a stream
+  write, and h2/h3 answer `{error, invalid_stream_state}` when a body is
+  written to a stream that must not carry one, where HTTP/1.1 silently
+  drops it.
+
+### Changed
+
+- **HTTP server moved from cowboy to livery**: hornbeam now serves HTTP
+  through [livery](https://github.com/benoitc/livery) instead of cowboy.
+  - The listener is owned by a new supervised `hornbeam_listener`
+    process; `hornbeam:info/0` and `hornbeam:is_running/0` replace ranch
+    introspection.
+  - `hornbeam_handler` is a livery handler; WSGI and ASGI responses
+    resolve through `livery_resp:stream_deferred/1` in the per-request
+    process (one mailbox for request-body chunks and Python events).
+  - WebSocket runs on the `ws_handler` behaviour (new
+    `hornbeam_ws_handler`); `hornbeam_websocket` keeps the upgrade
+    entry point, scope building, and the session registry.
+  - Duplicate request headers are preserved in the ASGI scope and
+    joined with `", "` in WSGI `HTTP_*` keys.
+  - New `max_body` option (default `infinity`) caps the request body at
+    the listener.
+  - Requires livery 0.8.0: 103 Early Hints go out through
+    `livery_req:inform/3`, WSGI `REMOTE_ADDR` and the ASGI `client` /
+    WebSocket scope carry the real peer, `websocket_max_frame_size` and
+    `websocket_compress` are forwarded to `livery_ws:upgrade/3`, and
+    ASGI `websocket.disconnect` reports the peer's own close code
+    (1005 when it closed without one).
+- **HTTP client moved from hackney to livery_client**: the test suites
+  call `livery_client` directly and match its response map; hackney is no
+  longer a direct dependency, and the shim that kept hackney's
+  `request/5` shape is gone.
+
+### Removed (breaking)
+
+- **`routes` option shape changed**: routes are livery router entries
+  `{Method | '_', Pattern, HandlerFun | {Mod, Fun}}` (optionally with a
+  meta map) instead of cowboy `{Path, HandlerModule, Opts}` tuples.
+  Cowboy handler modules are rejected with `{error, {invalid_route, _}}`.
+- **`hornbeam_wsgi` module removed**: the classic `build_environ/1,2`
+  path was dead code (the live path is
+  `hornbeam_request:build_wsgi_tuple/2`).
+
+### Known limitations
+
+- 103 Early Hints are sent on HTTP/1.1 and HTTP/2 but not HTTP/3, which
+  has no interim responses in livery yet; the
+  `http.response.early_hints` ASGI extension is advertised accordingly.
+
+- **erlang_python v3.0**: Track the simplified execution model
+  - Switched dep to erlang_python `main` (worker / owngil modes only)
+  - `config/sys.config`: replaced obsolete `num_workers` key with `num_contexts`
+  - Python runners (`asgi`, `lifespan`, `websocket`): import `erlang` instead of
+    the removed `erlang_loop` shim and skip `asyncio.set_event_loop_policy` on
+    Python 3.14+ (deprecated in 3.14, removed in 3.16)
+
+### Fixed
+
+- **Atom comparison in `hornbeam_erlang`**: result-tuple unwrap helpers
+  (`execute`, `execute_async`, `await_result`, `stream`) now recognise
+  Erlang atoms whether they surface as `erlang.Atom`, `bytes`, or `str`,
+  so `{ok, Value}` correctly returns `Value` instead of the raw tuple.
+- **Hook function-handler signature**: `hornbeam_hooks_runner` now
+  spreads `*args, **kwargs` into the documented
+  `def handler(action, *args, **kwargs)` signature instead of passing
+  the args list as a single positional.
+- **`hornbeam_hooks:execute_python_registered`**: pass through `{ok, _}`
+  / `{error, _}` from `py:call` instead of wrapping again, so
+  `execute(...)` returns the handler's value (was a `{ok, Inner}` shell).
+- **Stream generator storage**: `hornbeam_hooks:stream_ref/4` parks the
+  Erlang generator in an ETS table and returns the ref to Python (the
+  doc claimed Python could pass an Erlang `fun()` as a "ref"; nothing
+  ever populated the storage map).
+- **`hornbeam_erlang.call/cast` from Python**: registered the
+  `hornbeam_callbacks` Python-callable dispatcher so the documented
+  `from hornbeam_erlang import call` path actually reaches
+  `hornbeam_callbacks:call/2`.
+- **`hornbeam_erlang.publish` from Python**: registered a
+  `hornbeam_pubsub` Python-callable dispatcher so `publish(topic, msg)`
+  reaches `hornbeam_pubsub:publish/2` and returns the subscriber count.
+- **`state_get_multi` / `state_keys` from Python**: registered a
+  `hornbeam_state` Python-callable dispatcher.
+- **`stream` / `stream_next_ref` from Python**: routed
+  `hornbeam_hooks:stream/4` and `stream_next_ref/1` through the same
+  `hornbeam_hooks` dispatcher used for `reg_python` / `unreg`.
+- **`state_get_multi` semantics**: missing keys now map to `undefined`
+  (rendered as Python `None`) so the documented return shape
+  `{'user:3': None}` matches runtime.
+
+### Added
+
+- `test/hornbeam_examples_smoke_SUITE.erl` — HTTP smoke test for seven
+  example apps (`async_chat`, `channels_chat`, `demo/realtime_chat`,
+  `erlang_integration`, `fastapi_app`, `hooks_lifespan`,
+  `websocket_chat`). FastAPI-dependent cases auto-skip if the package is
+  missing.
+- `test/hornbeam_doc_python_api_SUITE.erl` — runs every runnable code
+  block from `docs/reference/python-api.md` verbatim. 16 snippets pass;
+  8 hook-related snippets are skipped pending a follow-up to fix nested
+  `py:exec` → `register_hook` callback synchronisation.
+- `scripts/docker_smoke.sh` + `make docker-smoke` target — builds every
+  Dockerfile in the repo (root, channels-chat, demo/distributed_rpc,
+  demo/multi_app; ml_caching gated on `DOCKER_SMOKE_HEAVY=1`).
+
+- **Shared Context Pool**: All mounts now share the default `py_context_router` pool
+  - Removed per-mount `workers` option (use global pool size instead)
+  - Better resource utilization across multiple mounted apps
+  - Simplified architecture with cached NIF refs
+
+- **ASGI Performance Optimizations**:
+  - Event loop pool for parallel ASGI task distribution
+  - Cached state proxies per mount_id (avoid allocation per request)
+  - Preloaded app modules via `py_import:ensure_imported`
+  - Lazy state proxy with ETS-backed callbacks
+
+### Performance
+
+- ASGI now outperforms WSGI by 11-16% across test scenarios:
+  - Simple requests (100 conc): ~70k req/s (+13%)
+  - High concurrency (500 conc): ~64k req/s (+16%)
+  - Sustained load (200 conc): ~71k req/s (+14%)
+
+### Removed
+
+- `workers` option from per-mount configuration (use shared pool)
+
 ## [1.4.1] - 2026-02-25
 
 ### Fixed

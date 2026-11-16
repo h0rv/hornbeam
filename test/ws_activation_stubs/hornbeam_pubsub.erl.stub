@@ -1,0 +1,3 @@
+-module(hornbeam_pubsub).
+-export([subscribe/2]).
+subscribe(_Topic, _Pid) -> ok.

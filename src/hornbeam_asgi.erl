@@ -12,142 +12,279 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 
-%%% @doc ASGI scope builder and protocol handling.
+%%% @doc ASGI handler.
 %%%
-%%% Builds ASGI 3.0 compliant scope dictionaries from Cowboy requests.
-%%% Supports HTTP/1.1, HTTP/2, and WebSocket scopes with proper extensions.
+%%% Requests run in their own livery request process. The Python task is
+%%% submitted to the event loop pool with this process's pid; response
+%%% events (start_response/chunk/fin/error) arrive as plain messages,
+%%% request-body chunks as `{livery_body, Ref, _}' messages, and client
+%%% disconnects as `{livery_disconnect, Ref, Reason}' - all handled by
+%%% one selective receive, first as a stream_deferred resolver (choosing
+%%% status and headers) and then as the stream producer.
 %%%
-%%% == HTTP Scope ==
-%%% Contains: type, asgi, http_version, method, scheme, path, query_string,
-%%% headers, server, client, root_path, state, extensions
-%%%
-%%% == Extensions ==
-%%% - http.response.trailers: Trailer support for HTTP/2
-%%% - http.response.push: Server push for HTTP/2
+%%% @end
 -module(hornbeam_asgi).
 
--export([
-    build_scope/1,
-    build_scope/2
-]).
+-export([handle/2]).
 
--type scope_opts() :: #{
-    root_path => binary(),
-    state => map(),
-    extensions => map()
-}.
+%% Threshold for passing the request body inline (64KB)
+%% Bodies smaller than this are read synchronously and passed as a binary
+-define(ASGI_BODY_BUFFER_THRESHOLD, 65536).
 
-%% @doc Build an ASGI scope dictionary from a Cowboy request.
--spec build_scope(cowboy_req:req()) -> map().
-build_scope(Req) ->
-    build_scope(Req, #{}).
+%%% ============================================================================
+%%% Entry point (called from hornbeam_handler)
+%%% ============================================================================
 
-%% @doc Build an ASGI scope dictionary with options.
-%%
-%% Options:
-%% - root_path: ASGI root_path (default: empty binary)
-%% - state: Shared state dict from lifespan (default: empty map)
-%% - extensions: Additional extensions to include
--spec build_scope(cowboy_req:req(), scope_opts()) -> map().
-build_scope(Req, Opts) ->
-    %% Get basic request info
-    Method = cowboy_req:method(Req),
-    Path = cowboy_req:path(Req),
-    RawPath = cowboy_req:path(Req),
-    Qs = cowboy_req:qs(Req),
-    Headers = cowboy_req:headers(Req),
-    Host = cowboy_req:host(Req),
-    Port = cowboy_req:port(Req),
-    Scheme = cowboy_req:scheme(Req),
-    Version = cowboy_req:version(Req),
+-spec handle(livery_req:req(), map()) -> livery_resp:resp().
+handle(Req, HandlerState) ->
+    ReqInfo = hornbeam_handler:build_request_info(Req, HandlerState),
+    ReqInfo1 = hornbeam_http_hooks:run_on_request(ReqInfo),
 
-    %% Get client info
-    {ClientIp, ClientPort} = cowboy_req:peer(Req),
+    AppModule = maps:get(app_module, HandlerState),
+    AppCallable = maps:get(app_callable, HandlerState),
+    TimeoutMs = maps:get(timeout, HandlerState, 30000),
 
-    %% Convert headers to list of [name, value] pairs
-    HeaderList = maps:fold(fun(Name, Value, Acc) ->
-        [[Name, Value] | Acc]
-    end, [], Headers),
+    %% Build ASGI scope
+    Scope = hornbeam_request:build_asgi_scope(Req, HandlerState),
 
-    %% Get root_path and state from options or lifespan
-    RootPath = maps:get(root_path, Opts, get_root_path()),
-    State = maps:get(state, Opts, get_lifespan_state()),
+    %% Body exists if: Content-Length > 0, or Transfer-Encoding is present
+    Method = livery_req:method(Req),
+    ContentLength = hornbeam_handler:get_content_length(Req),
+    TransferEncoding = livery_req:header(<<"transfer-encoding">>, Req),
+    HasBody = has_request_body(Method, ContentLength, TransferEncoding),
 
-    %% Build extensions based on HTTP version
-    Extensions = build_extensions(Version, Opts),
+    %% Small bodies with known Content-Length are read synchronously and
+    %% passed directly; larger/streaming bodies flow through a byte
+    %% channel fed by this process's receive loop
+    {BodyArg, BodyRef} = case {HasBody, livery_req:body(Req)} of
+        {false, _} ->
+            {empty, undefined};
+        {true, empty} ->
+            {empty, undefined};
+        {true, {buffered, Data}} ->
+            {{body, {bytes, iolist_to_binary(Data)}}, undefined};
+        {true, {stream, Reader}} when is_integer(ContentLength),
+                                      ContentLength =< ?ASGI_BODY_BUFFER_THRESHOLD ->
+            case livery_body:read_all(Reader, TimeoutMs, infinity) of
+                {ok, Body, _Reader1} ->
+                    {{body, {bytes, Body}}, undefined};
+                {error, _Reason, _Reader1} ->
+                    %% Truncated client body: hand Python what we have
+                    {{body, {bytes, <<>>}}, undefined}
+            end;
+        {true, {stream, Reader}} ->
+            {ok, Ch} = py_byte_channel:new(),
+            {{channel, Ch}, livery_body:ref(Reader)}
+    end,
 
-    #{
-        <<"type">> => <<"http">>,
-        <<"asgi">> => #{
-            <<"version">> => <<"3.0">>,
-            <<"spec_version">> => <<"2.4">>
-        },
-        <<"http_version">> => format_http_version(Version),
-        <<"method">> => Method,
-        <<"scheme">> => Scheme,
-        <<"path">> => Path,
-        <<"raw_path">> => RawPath,
-        <<"query_string">> => Qs,
-        <<"root_path">> => RootPath,
-        <<"headers">> => HeaderList,
-        <<"server">> => [Host, Port],
-        <<"client">> => [format_ip(ClientIp), ClientPort],
-        <<"state">> => State,
-        <<"extensions">> => Extensions
-    }.
+    %% Submit task to event loop pool for parallel distribution
+    {ok, LoopRef} = py_event_loop_pool:get_loop(),
+    TaskRef = make_ref(),
+    ok = py_nif:submit_task(LoopRef, self(), TaskRef,
+        <<"hornbeam_asgi_worker">>, <<"handle_asgi">>,
+        [self(), AppModule, AppCallable, Scope, BodyArg], #{}),
 
-%% @private
-get_root_path() ->
-    case hornbeam_config:get_config(root_path) of
-        undefined -> <<>>;
-        Path -> ensure_binary(Path)
+    St = #{
+        req => Req,
+        req_info => ReqInfo1,
+        channel => body_channel(BodyArg),
+        body_ref => BodyRef,
+        timeout_ms => TimeoutMs
+    },
+    livery_resp:stream_deferred(fun() -> wait_response(St) end).
+
+%%% ============================================================================
+%%% Resolver: wait for the response head while pumping the request body
+%%% ============================================================================
+
+wait_response(#{req_info := ReqInfo, timeout_ms := TimeoutMs} = St) ->
+    BodyRef = pump_ref(St),
+    receive
+        {livery_body, BodyRef, {data, Data}} ->
+            case push_to_channel(St, Data) of
+                ok -> wait_response(St);
+                {error, interrupted} -> wait_response(St#{body_ref := undefined});
+                {error, Reason} -> hornbeam_handler:error_decision(Reason, ReqInfo)
+            end;
+        {livery_body, BodyRef, _EofOrError} ->
+            %% eof/trailers/reset/error all end the request body; a reset
+            %% surfaces to Python as EOF on its body reads
+            maybe_close_channel(maps:get(channel, St)),
+            wait_response(St#{body_ref := undefined});
+        {<<"start_response">>, StatusCode, Headers, FirstChunk} ->
+            SafeHeaders = hornbeam_handler:convert_headers(
+                hornbeam_handler:filter_hop_by_hop(Headers)),
+            Status = hornbeam_handler:parse_status_code(StatusCode),
+            {stream, Status, SafeHeaders,
+             fun(Emit) -> stream_response(Emit, FirstChunk, St) end};
+        {<<"early_hints">>, Headers} ->
+            %% Best-effort: h3 (and HTTP/1.0 clients) have no interim
+            %% responses, and livery answers {error, unsupported}
+            _ = livery_req:inform(103, hornbeam_handler:convert_headers(Headers),
+                                  maps:get(req, St)),
+            wait_response(St);
+        <<"fin">> ->
+            cleanup(St),
+            hornbeam_handler:error_decision(response_finished, ReqInfo);
+        {<<"error">>, Reason} ->
+            cleanup(St),
+            hornbeam_handler:error_decision(Reason, ReqInfo);
+        {async_result, _Ref, {ok, _}} ->
+            wait_response(St);
+        {async_result, _Ref, {error, Reason}} ->
+            cleanup(St),
+            hornbeam_handler:error_decision(Reason, ReqInfo);
+        {livery_disconnect, _Ref, _Reason} ->
+            %% Client gone before the response started; the emit of this
+            %% decision fails on the closed stream, which livery treats
+            %% as a peer disconnect
+            cleanup(St),
+            {full, 500, [], <<>>}
+    after TimeoutMs ->
+        cleanup(St),
+        hornbeam_handler:error_decision(timeout, ReqInfo)
+    end.
+
+%%% ============================================================================
+%%% Producer: stream chunks to the client
+%%% ============================================================================
+
+stream_response(Emit, FirstChunk, St) ->
+    case hornbeam_handler:to_binary(FirstChunk) of
+        <<>> ->
+            stream_loop(Emit, St);
+        Body ->
+            case Emit(Body) of
+                ok -> stream_loop(Emit, St);
+                {error, _} -> stream_done(St)
+            end
+    end.
+
+stream_loop(Emit, #{timeout_ms := TimeoutMs} = St) ->
+    BodyRef = pump_ref(St),
+    receive
+        {livery_body, BodyRef, {data, Data}} ->
+            case push_to_channel(St, Data) of
+                ok -> stream_loop(Emit, St);
+                {error, interrupted} -> stream_loop(Emit, St#{body_ref := undefined});
+                {error, Reason} -> {error, Reason}
+            end;
+        {livery_body, BodyRef, _EofOrError} ->
+            maybe_close_channel(maps:get(channel, St)),
+            stream_loop(Emit, St#{body_ref := undefined});
+        {<<"chunk">>, Data} ->
+            case Emit(hornbeam_handler:to_binary(Data)) of
+                ok -> stream_loop(Emit, St);
+                {error, _} -> stream_done(St)
+            end;
+        <<"fin">> ->
+            cleanup(St),
+            ok;
+        {<<"early_hints">>, _} ->
+            %% Too late: the final response head is already on the wire
+            stream_loop(Emit, St);
+        {<<"error">>, Reason} ->
+            %% Response already started: truncate the stream explicitly.
+            cleanup(St),
+            {error, Reason};
+        {async_result, _Ref, {error, Reason}} ->
+            cleanup(St),
+            {error, Reason};
+        {async_result, _Ref, _} ->
+            stream_loop(Emit, St);
+        {livery_disconnect, _Ref, _Reason} ->
+            stream_done(St)
+    after TimeoutMs ->
+        cleanup(St),
+        ok
     end.
 
 %% @private
-get_lifespan_state() ->
-    case catch hornbeam_lifespan:get_state() of
-        State when is_map(State) -> State;
-        _ -> #{}
+%% Stop producing: the stream will take no more data. Either the client
+%% disconnected, or the stream rejects a body at all - an h2/h3 response
+%% to HEAD answers `{error, invalid_stream_state}' rather than swallowing
+%% the bytes the way HTTP/1.1 does. Close the byte channel either way so
+%% Python's body reads hit EOF (its sends to this pid are dropped once we
+%% return).
+stream_done(St) ->
+    cleanup(St),
+    {error, closed}.
+
+%%% ============================================================================
+%%% Internal Functions
+%%% ============================================================================
+
+%% @private
+%% Only pump raw body messages while a channel is live; otherwise use a
+%% fresh ref that matches nothing.
+pump_ref(#{body_ref := Ref}) when is_reference(Ref) -> Ref;
+pump_ref(_) -> make_ref().
+
+%% @private
+body_channel({channel, Ch}) -> Ch;
+body_channel(_) -> undefined.
+
+%% @private
+cleanup(St) ->
+    maybe_close_channel(maps:get(channel, St)).
+
+%% A full body channel must not trap the request process indefinitely.
+%% Preserve terminal messages for the normal resolver/producer receive loop.
+%% The monotonic deadline covers all retries, rather than resetting per retry.
+push_to_channel(#{timeout_ms := TimeoutMs} = St, Data) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    Result = push_to_channel(St, Data, Deadline),
+    case Result of
+        ok -> ok;
+        {error, _} -> cleanup(St), Result
+    end.
+
+push_to_channel(#{channel := Channel} = St, Data, Deadline) ->
+    case py_byte_channel:send(Channel, Data) of
+        ok -> ok;
+        busy -> wait_body_capacity(St, Data, Deadline);
+        {error, Reason} -> {error, {body_channel, Reason}}
+    end.
+
+wait_body_capacity(St, Data, Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    receive
+        {livery_disconnect, _, _} = Msg -> body_interrupted(Msg);
+        <<"fin">> = Msg -> body_interrupted(Msg);
+        {<<"error">>, _} = Msg -> body_interrupted(Msg);
+        {async_result, _, {error, _}} = Msg -> body_interrupted(Msg)
+    after max(0, min(10, Remaining)) ->
+        case erlang:monotonic_time(millisecond) >= Deadline of
+            true -> {error, body_channel_timeout};
+            false -> push_to_channel(St, Data, Deadline)
+        end
+    end.
+
+body_interrupted(Msg) ->
+    self() ! Msg,
+    {error, interrupted}.
+
+maybe_close_channel(undefined) -> ok;
+maybe_close_channel(Channel) ->
+    try
+        case py_byte_channel:info(Channel) of
+            #{closed := true} -> ok;
+            _ ->
+                _ = py_byte_channel:close(Channel),
+                ok
+        end
+    catch
+        _:_ -> ok
     end.
 
 %% @private
-%% Build ASGI extensions based on HTTP version
-build_extensions(Version, Opts) ->
-    BaseExtensions = maps:get(extensions, Opts, #{}),
-
-    %% Add HTTP/2 specific extensions
-    case Version of
-        'HTTP/2' ->
-            BaseExtensions#{
-                <<"http.response.trailers">> => #{},
-                <<"http.response.early_hints">> => #{}
-            };
-        _ ->
-            %% HTTP/1.1 still supports early hints
-            BaseExtensions#{
-                <<"http.response.early_hints">> => #{}
-            }
-    end.
-
-%% @private
-format_http_version('HTTP/1.0') -> <<"1.0">>;
-format_http_version('HTTP/1.1') -> <<"1.1">>;
-format_http_version('HTTP/2') -> <<"2">>.
-
-%% @private
-%% IPv4 - optimized to avoid io_lib:format overhead
-format_ip({A, B, C, D}) ->
-    list_to_binary([
-        integer_to_list(A), $.,
-        integer_to_list(B), $.,
-        integer_to_list(C), $.,
-        integer_to_list(D)
-    ]);
-%% IPv6 - use inet:ntoa which is implemented in C
-format_ip(Addr = {_, _, _, _, _, _, _, _}) ->
-    list_to_binary(inet:ntoa(Addr)).
-
-%% @private
-ensure_binary(V) when is_binary(V) -> V;
-ensure_binary(V) when is_list(V) -> list_to_binary(V);
-ensure_binary(V) when is_atom(V) -> atom_to_binary(V, utf8).
+%% Check if request has a body based on method, content-length, and transfer-encoding
+%% Per HTTP spec: body exists if Content-Length > 0 OR Transfer-Encoding is present
+has_request_body(_, _, TE) when TE =/= undefined -> true;  %% Transfer-Encoding present
+has_request_body(_, 0, _) -> false;                         %% Content-Length: 0
+has_request_body(_, CL, _) when is_integer(CL), CL > 0 -> true;  %% Content-Length > 0
+has_request_body(<<"GET">>, _, _) -> false;
+has_request_body(<<"HEAD">>, _, _) -> false;
+has_request_body(<<"DELETE">>, _, _) -> false;
+has_request_body(<<"OPTIONS">>, _, _) -> false;
+has_request_body(_, undefined, undefined) -> false.         %% No CL, no TE = no body
