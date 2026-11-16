@@ -12,504 +12,236 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ASGI Lifespan runner module for hornbeam.
+"""Persistent ASGI lifespan execution on Hornbeam's running event-loop pool.
 
-This module handles the ASGI lifespan protocol for application
-startup and shutdown events.
-
-The lifespan protocol allows ASGI applications to:
-- Initialize resources at startup (DB connections, ML models, etc.)
-- Clean up resources at shutdown
-- Share state across all requests via scope['state']
+The Erlang manager owns the control channel and the submitted coroutine. No
+private loop is created or paused. Applications sharing loop-bound resources
+with requests require erlang_python.event_loop_pool_size=1 for the MVP.
+Request scopes shallow-copy the retained Python state in the shared interpreter,
+preserving resource identity. The startup report also supplies a bridge-converted
+snapshot to the Erlang manager; it is not the source for request state.
 """
 
 import asyncio
 import importlib
+import logging
 import os
 import sys
-from typing import Dict, Any, Optional
+from collections.abc import Awaitable, Callable
+from typing import Protocol
 
-# Dev reload mode: when True, evicts modules from sys.modules before import
-# Set HORNBEAM_DEV_RELOAD=1 to enable (for hot-reload during development)
+Message = dict[str, object]
+Receive = Callable[[], Awaitable[Message]]
+Send = Callable[[Message], Awaitable[None]]
+
+
+class ASGIApp(Protocol):
+    def __call__(self, scope: Message, receive: Receive, send: Send) -> Awaitable[None]: ...
+
+
 _DEV_RELOAD = os.environ.get('HORNBEAM_DEV_RELOAD', '').lower() in ('1', 'true', 'yes')
+_lifespan_state: Message = {}
+_lifespan_states: dict[str, Message] = {}
+# Cancellation is cooperative. Retain and observe tasks that refuse it rather
+# than blocking the manager forever or letting tasks disappear unobserved.
+_unfinished_tasks: set[asyncio.Task[None]] = set()
+_CANCEL_GRACE = 0.1
 
 
-# Install erlang event loop as the default event loop policy (once per interpreter)
-def _install_erlang_loop() -> bool:
-    """Install erlang event loop as the default asyncio event loop policy."""
-    if sys.version_info >= (3, 14):
-        # asyncio.set_event_loop_policy is deprecated in 3.14 / removed in 3.16.
-        # erlang.run() and asyncio.Runner(loop_factory=...) provide the loop directly.
-        return False
-    try:
-        import erlang
-        asyncio.set_event_loop_policy(erlang.get_event_loop_policy())
-        return True
-    except (ImportError, AttributeError, RuntimeError):
-        return False
-
-
-_install_erlang_loop()
-
-
-# Per-mount lifespan state for multi-app mode
-_lifespan_states: Dict[str, Dict[str, Any]] = {}
-
-# Per-mount lifespan tracking for multi-app mode
-_mount_lifespans: Dict[str, dict] = {}
-
-# Global lifespan state for single-app mode (backward compat)
-_lifespan_state: Dict[str, Any] = {}
-_lifespan_app = None
-_lifespan_task = None
-_receive_queue: Optional[asyncio.Queue] = None
-_send_queue: Optional[asyncio.Queue] = None
-_loop: Optional[asyncio.AbstractEventLoop] = None
-
-
-def load_app(module_name: str, callable_name: str):
-    """Load an ASGI application."""
+def load_app(module_name: str, callable_name: str) -> ASGIApp:
+    """Resolve the configured application, preserving development reload."""
     if _DEV_RELOAD and module_name in sys.modules:
         del sys.modules[module_name]
     module = importlib.import_module(module_name)
     return getattr(module, callable_name)
 
 
-async def _run_lifespan(app, scope: dict):
-    """Run the ASGI lifespan protocol."""
-    async def receive():
-        return await _receive_queue.get()
-
-    async def send(message):
-        await _send_queue.put(message)
-
-    try:
-        await app(scope, receive, send)
-    except Exception as e:
-        # App crashed - send failure message
-        await _send_queue.put({
-            'type': 'lifespan.startup.failed',
-            'message': str(e)
-        })
+def _observe_task(task: asyncio.Task[None]) -> None:
+    _unfinished_tasks.discard(task)
+    if not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            logging.getLogger(__name__).error('Lifespan task cleanup failed: %s', error)
 
 
-def startup(app_module: str, app_callable: str, timeout_ms: int = 30000) -> dict:
-    """Run lifespan startup protocol.
-
-    Args:
-        app_module: Python module containing the ASGI app
-        app_callable: Name of the ASGI callable
-        timeout_ms: Timeout for startup in milliseconds (default: 30000)
-
-    Returns:
-        Response dict with type and optional state
-    """
-    global _lifespan_state, _lifespan_app, _lifespan_task
-    global _receive_queue, _send_queue, _loop
-
-    # Load the app
-    try:
-        app = load_app(app_module, app_callable)
-    except Exception as e:
-        return {'type': 'lifespan.startup.failed', 'message': str(e)}
-
-    # Create event loop
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
-
-    # Create queues
-    _receive_queue = asyncio.Queue()
-    _send_queue = asyncio.Queue()
-
-    # Build lifespan scope
-    scope = {
-        'type': 'lifespan',
-        'asgi': {
-            'version': '3.0',
-            'spec_version': '2.4'
-        },
-        'state': _lifespan_state
-    }
-
-    # Start the lifespan task
-    _lifespan_app = app
-    _lifespan_task = _loop.create_task(_run_lifespan(app, scope))
-
-    # Send startup event
-    _loop.run_until_complete(_receive_queue.put({'type': 'lifespan.startup'}))
-
-    # Wait for response, checking if app exits early (doesn't support lifespan)
-    async def wait_for_response():
-        """Wait for a response, checking if task exits early."""
-        # Give the app a small moment to process the startup event
-        await asyncio.sleep(0.01)
-
-        # Check if task already finished (app doesn't support lifespan)
-        if _lifespan_task.done():
-            return None
-
-        # Wait for response with timeout, checking periodically if task finished
-        total_timeout = timeout_ms / 1000.0
-        check_interval = 0.5
-        elapsed = 0.0
-
-        while elapsed < total_timeout:
-            try:
-                response = await asyncio.wait_for(
-                    _send_queue.get(),
-                    timeout=check_interval
-                )
-                return response
-            except asyncio.TimeoutError:
-                # Check if task finished while we were waiting
-                if _lifespan_task.done():
-                    return None
-                elapsed += check_interval
-
-        raise asyncio.TimeoutError()
-
-    try:
-        response = _loop.run_until_complete(wait_for_response())
-        if response is None:
-            # App exited without sending - doesn't support lifespan
-            _cleanup()
-            return {'type': 'lifespan.not_supported'}
-    except asyncio.TimeoutError:
-        return {'type': 'lifespan.startup.failed',
-                'message': 'Startup timeout'}
-    except Exception as e:
-        return {'type': 'lifespan.startup.failed', 'message': str(e)}
-
-    msg_type = response.get('type', '')
-
-    if msg_type == 'lifespan.startup.complete':
-        # Store state for access by requests
-        _lifespan_state = scope.get('state', {})
-        return {
-            'type': 'lifespan.startup.complete',
-            'state': _lifespan_state
-        }
-    elif msg_type == 'lifespan.startup.failed':
-        # Clean up
-        _cleanup()
-        return response
+async def _cancel_task(task: asyncio.Task[None]) -> None:
+    if not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=_CANCEL_GRACE)
+    if task.done():
+        _observe_task(task)
     else:
-        # App doesn't support lifespan (sent http.* or websocket.* message)
-        _cleanup()
-        return {'type': 'lifespan.not_supported'}
+        _unfinished_tasks.add(task)
+        task.add_done_callback(_observe_task)
+        logging.getLogger(__name__).error('Lifespan task ignored cancellation')
 
 
-def shutdown(app_module: str, app_callable: str) -> dict:
-    """Run lifespan shutdown protocol.
+async def _response_or_exit(
+    response: asyncio.Future[Message], task: asyncio.Task[None], timeout: float,
+    phase: str,
+) -> Message:
+    done, _ = await asyncio.wait({response, task}, timeout=timeout,
+                                 return_when=asyncio.FIRST_COMPLETED)
+    # Preserve explicit failure messages, but never report startup readiness
+    # when the application has already exited in the same loop turn.
+    if response in done:
+        message = response.result()
+        if phase == 'startup' and message.get('type') == 'lifespan.startup.complete' and task.done():
+            if task.cancelled():
+                reason = 'Application cancelled'
+            else:
+                error = task.exception()
+                reason = str(error) if error is not None else 'Application exited after startup response'
+            return {'type': 'lifespan.startup.failed', 'message': reason}
+        return message
+    if task in done:
+        if task.cancelled():
+            return {'type': f'lifespan.{phase}.failed', 'message': 'Application cancelled'}
+        error = task.exception()
+        if error is not None:
+            return {'type': f'lifespan.{phase}.failed', 'message': str(error)}
+        if phase == 'startup':
+            return {'type': 'lifespan.not_supported'}
+        return {'type': 'lifespan.shutdown.failed', 'message': 'Application exited without shutdown response'}
+    return {'type': f'lifespan.{phase}.failed', 'message': f'{phase.title()} timeout'}
 
-    Args:
-        app_module: Python module (for reference)
-        app_callable: ASGI callable name (for reference)
 
-    Returns:
-        Response dict with shutdown status
+async def run_lifespan(
+    pid: object, token: int, channel_ref: object, app_module: str,
+    app_callable: str, mount_id: str | None, timeout_ms: int = 30000,
+) -> None:
+    """Own one application's lifespan until shutdown or control-channel closure.
+
+    Protocol responses go directly to the manager. The native input channel also
+    lets an Erlang timeout interrupt an application that is not in receive().
     """
-    global _lifespan_task, _loop
+    import erlang
 
-    if _lifespan_task is None or _loop is None:
-        return {'type': 'lifespan.shutdown.complete'}
+    channel = erlang.Channel(channel_ref)
+    task: asyncio.Task[None] | None = None
+    control: asyncio.Task[object] | None = None
+    loop = asyncio.get_running_loop()
+    startup_response: asyncio.Future[Message] = loop.create_future()
+    shutdown_response: asyncio.Future[Message] = loop.create_future()
+    receive_queue: asyncio.Queue[Message] = asyncio.Queue(maxsize=2)
+    phase = 'startup'
+    timeout = timeout_ms / 1000
+    state = _lifespan_state if mount_id is None else {}
+
+    def report(message: Message) -> None:
+        erlang.send(pid, ('lifespan', token, message))
+
+    async def receive() -> Message:
+        return await receive_queue.get()
+
+    async def send(message: Message) -> None:
+        response = startup_response if phase == 'startup' else shutdown_response
+        if response.done():
+            raise RuntimeError('Duplicate lifespan response')
+        response.set_result(message)
 
     try:
-        # Send shutdown event
-        _loop.run_until_complete(
-            _receive_queue.put({'type': 'lifespan.shutdown'})
-        )
-
-        # Wait for response
-        try:
-            response = _loop.run_until_complete(
-                asyncio.wait_for(_send_queue.get(), timeout=10.0)
-            )
-        except asyncio.TimeoutError:
-            response = {'type': 'lifespan.shutdown.complete'}
-
-        # Wait for task to finish
-        try:
-            _loop.run_until_complete(
-                asyncio.wait_for(_lifespan_task, timeout=5.0)
-            )
-        except asyncio.TimeoutError:
-            _lifespan_task.cancel()
-            try:
-                _loop.run_until_complete(_lifespan_task)
-            except asyncio.CancelledError:
-                pass
-
-        return response
-
-    except Exception as e:
-        return {'type': 'lifespan.shutdown.complete',
-                'error': str(e)}
-    finally:
-        _cleanup()
-
-
-def startup_mount(mount_id: str, app_module: str, app_callable: str,
-                  timeout_ms: int = 30000) -> dict:
-    """Run lifespan startup protocol for a specific mount.
-
-    This is used in multi-app mode to run lifespan per mounted app.
-    Each mount gets its own isolated state dict.
-
-    Args:
-        mount_id: Unique identifier for this mount
-        app_module: Python module containing the ASGI app
-        app_callable: Name of the ASGI callable
-        timeout_ms: Timeout for startup in milliseconds (default: 30000)
-
-    Returns:
-        Response dict with type and optional state
-    """
-    global _lifespan_states, _mount_lifespans
-
-    # erlang_python converts binaries to str in C - no decode needed
-
-    # Load the app
-    try:
+        command = await channel.async_receive(native_only=True)
+        if command not in ('lifespan.startup', b'lifespan.startup'):
+            raise RuntimeError('Expected lifespan.startup')
         app = load_app(app_module, app_callable)
-    except Exception as e:
-        return {'type': 'lifespan.startup.failed', 'message': str(e)}
+        scope: Message = {
+            'type': 'lifespan',
+            'asgi': {'version': '3.0', 'spec_version': '2.4'},
+            'state': state,
+        }
 
-    # Create per-mount event loop and queues
-    loop = asyncio.new_event_loop()
-    receive_queue = asyncio.Queue()
-    send_queue = asyncio.Queue()
-
-    # Initialize state dict for this mount
-    mount_state: Dict[str, Any] = {}
-    _lifespan_states[mount_id] = mount_state
-
-    # Build lifespan scope with per-mount state
-    scope = {
-        'type': 'lifespan',
-        'asgi': {
-            'version': '3.0',
-            'spec_version': '2.4'
-        },
-        'state': mount_state
-    }
-
-    # Create lifespan runner for this mount
-    async def run_mount_lifespan():
-        async def receive():
-            return await receive_queue.get()
-        async def send(message):
-            await send_queue.put(message)
-        try:
+        async def invoke() -> None:
             await app(scope, receive, send)
-        except Exception as e:
-            await send_queue.put({
-                'type': 'lifespan.startup.failed',
-                'message': str(e)
-            })
 
-    # Start the lifespan task
-    task = loop.create_task(run_mount_lifespan())
+        task = asyncio.create_task(invoke())
+        receive_queue.put_nowait({'type': 'lifespan.startup'})
+        response = await _response_or_exit(startup_response, task, timeout, phase)
+        kind = response.get('type')
+        if kind != 'lifespan.startup.complete':
+            if kind != 'lifespan.startup.failed':
+                response = {'type': 'lifespan.not_supported'}
+            report(response)
+            return
+        # Preserve the current state result contract, including scope replacement.
+        state_result = scope.get('state', {})
+        if not isinstance(state_result, dict):
+            raise TypeError('Lifespan state must be a dict')
+        state = state_result
+        if mount_id is None:
+            _replace_state(state)
+        else:
+            _lifespan_states[mount_id] = state
+        report({'type': 'lifespan.startup.complete', 'state': state_result})
 
-    # Store mount lifespan tracking
-    _mount_lifespans[mount_id] = {
-        'app': app,
-        'task': task,
-        'loop': loop,
-        'receive_queue': receive_queue,
-        'send_queue': send_queue
-    }
-
-    # Send startup event
-    loop.run_until_complete(receive_queue.put({'type': 'lifespan.startup'}))
-
-    # Wait for response
-    async def wait_for_response():
-        await asyncio.sleep(0.01)
-        if task.done():
-            return None
-        total_timeout = timeout_ms / 1000.0
-        check_interval = 0.5
-        elapsed = 0.0
-        while elapsed < total_timeout:
-            try:
-                response = await asyncio.wait_for(
-                    send_queue.get(),
-                    timeout=check_interval
-                )
-                return response
-            except asyncio.TimeoutError:
-                if task.done():
-                    return None
-                elapsed += check_interval
-        raise asyncio.TimeoutError()
-
-    try:
-        response = loop.run_until_complete(wait_for_response())
-        if response is None:
-            _cleanup_mount(mount_id)
-            return {'type': 'lifespan.not_supported'}
-    except asyncio.TimeoutError:
-        return {'type': 'lifespan.startup.failed',
-                'message': 'Startup timeout'}
-    except Exception as e:
-        return {'type': 'lifespan.startup.failed', 'message': str(e)}
-
-    msg_type = response.get('type', '')
-
-    if msg_type == 'lifespan.startup.complete':
-        # Store state for access by requests
-        _lifespan_states[mount_id] = scope.get('state', {})
-        return {
-            'type': 'lifespan.startup.complete',
-            'state': _lifespan_states[mount_id]
-        }
-    elif msg_type == 'lifespan.startup.failed':
-        _cleanup_mount(mount_id)
-        return response
-    else:
-        _cleanup_mount(mount_id)
-        return {'type': 'lifespan.not_supported'}
-
-
-def shutdown_mount(mount_id: str, app_module: str, app_callable: str) -> dict:
-    """Run lifespan shutdown protocol for a specific mount.
-
-    Args:
-        mount_id: Unique identifier for this mount
-        app_module: Python module (for reference)
-        app_callable: ASGI callable name (for reference)
-
-    Returns:
-        Response dict with shutdown status
-    """
-    global _mount_lifespans, _lifespan_states
-
-    # erlang_python converts binaries to str in C - no decode needed
-
-    if mount_id not in _mount_lifespans:
-        return {'type': 'lifespan.shutdown.complete'}
-
-    mount = _mount_lifespans[mount_id]
-    task = mount['task']
-    loop = mount['loop']
-    receive_queue = mount['receive_queue']
-    send_queue = mount['send_queue']
-
-    try:
-        # Send shutdown event
-        loop.run_until_complete(
-            receive_queue.put({'type': 'lifespan.shutdown'})
-        )
-
-        # Wait for response
-        try:
-            response = loop.run_until_complete(
-                asyncio.wait_for(send_queue.get(), timeout=10.0)
-            )
-        except asyncio.TimeoutError:
-            response = {'type': 'lifespan.shutdown.complete'}
-
-        # Wait for task to finish
-        try:
-            loop.run_until_complete(
-                asyncio.wait_for(task, timeout=5.0)
-            )
-        except asyncio.TimeoutError:
-            task.cancel()
-            try:
-                loop.run_until_complete(task)
-            except asyncio.CancelledError:
-                pass
-
-        return response
-
-    except Exception as e:
-        return {'type': 'lifespan.shutdown.complete',
-                'error': str(e)}
+        # This await keeps the coroutine alive without pausing the pool loop.
+        # Also detect app exit instead of leaving a zombie started lifespan.
+        control = asyncio.create_task(channel.async_receive(native_only=True))
+        done, _ = await asyncio.wait({control, task}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            error = None if task.cancelled() else task.exception()
+            raise RuntimeError(f'Lifespan exited before shutdown: {error}')
+        command = control.result()
+        if command not in ('lifespan.shutdown', b'lifespan.shutdown'):
+            raise RuntimeError('Expected lifespan.shutdown')
+        phase = 'shutdown'
+        deadline = loop.time() + timeout
+        receive_queue.put_nowait({'type': 'lifespan.shutdown'})
+        response = await _response_or_exit(shutdown_response, task, timeout, phase)
+        if response.get('type') == 'lifespan.shutdown.complete' and not task.done():
+            await asyncio.wait({task}, timeout=max(0, deadline - loop.time()))
+            if not task.done():
+                response = {'type': 'lifespan.shutdown.failed', 'message': 'Shutdown task timeout'}
+        if task.done() and not task.cancelled() and task.exception() is not None:
+            response = {'type': 'lifespan.shutdown.failed', 'message': str(task.exception())}
+        await _cancel_task(task)
+        report(response)
+    except erlang.ChannelClosed:
+        # Manager timed out or is terminating. Its caller already has an outcome.
+        pass
+    except Exception as error:
+        if startup_response.done() and phase == 'startup':
+            # Startup was already reported; async_result exposes unexpected exit.
+            raise
+        report({'type': f'lifespan.{phase}.failed', 'message': str(error)})
     finally:
-        _cleanup_mount(mount_id)
-
-
-def _cleanup_mount(mount_id: str):
-    """Clean up lifespan state for a specific mount."""
-    global _mount_lifespans, _lifespan_states
-
-    if mount_id in _mount_lifespans:
-        mount = _mount_lifespans[mount_id]
-        task = mount.get('task')
-        loop = mount.get('loop')
-
-        if task and not task.done():
-            task.cancel()
-            if loop:
+        try:
+            if control is not None:
+                if not control.done():
+                    control.cancel()
                 try:
-                    loop.run_until_complete(task)
-                except asyncio.CancelledError:
+                    await control
+                except (asyncio.CancelledError, erlang.ChannelClosed):
                     pass
-
-        if loop:
-            loop.close()
-
-        del _mount_lifespans[mount_id]
-
-    if mount_id in _lifespan_states:
-        del _lifespan_states[mount_id]
-
-
-def _cleanup():
-    """Clean up lifespan state."""
-    global _lifespan_app, _lifespan_task, _receive_queue, _send_queue, _loop
-
-    if _lifespan_task and not _lifespan_task.done():
-        _lifespan_task.cancel()
-        if _loop:
+        finally:
+            # A failed native receive must not bypass application cleanup. Keep
+            # its original exception while always releasing this mount's state.
             try:
-                _loop.run_until_complete(_lifespan_task)
-            except asyncio.CancelledError:
-                pass
-
-    if _loop:
-        _loop.close()
-
-    _lifespan_app = None
-    _lifespan_task = None
-    _receive_queue = None
-    _send_queue = None
-    _loop = None
+                if task is not None and not task.done() and task not in _unfinished_tasks:
+                    await _cancel_task(task)
+            finally:
+                if mount_id is None:
+                    if _lifespan_state is state:
+                        clear_state()
+                elif _lifespan_states.get(mount_id) is state:
+                    _lifespan_states.pop(mount_id, None)
 
 
-def get_state(mount_id: Optional[str] = None) -> dict:
-    """Get the lifespan state dict.
+def _replace_state(state: Message) -> None:
+    global _lifespan_state
+    _lifespan_state = state
 
-    This returns the actual dict (not a copy) so that modifications
-    by request handlers persist across requests - as per ASGI spec.
 
-    Args:
-        mount_id: Optional mount identifier for multi-app mode.
-                  If None, returns single-app mode state.
-
-    Returns:
-        The lifespan state dict for the specified mount (or global state).
-    """
+def get_state(mount_id: str | None = None) -> Message:
+    """Return this lifespan's Python state; request handlers must shallow-copy it."""
     if mount_id is None:
         return _lifespan_state
-
-    # erlang_python converts binaries to str in C - no decode needed
     return _lifespan_states.get(mount_id, {})
 
 
-def set_state(key: str, value: Any) -> None:
-    """Set a value in the lifespan state.
-
-    Args:
-        key: State key
-        value: Value to store
-    """
+def set_state(key: str, value: object) -> None:
     _lifespan_state[key] = value
 
 
 def clear_state() -> None:
-    """Clear all lifespan state."""
-    global _lifespan_state
-    _lifespan_state = {}
+    _replace_state({})

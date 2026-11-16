@@ -85,7 +85,8 @@
     app_module :: binary(),
     app_callable :: binary(),
     started = false :: boolean(),
-    supported = unknown :: boolean() | unknown
+    supported = unknown :: boolean() | unknown,
+    session = undefined :: term()
 }).
 
 -record(state, {
@@ -96,6 +97,7 @@
     py_context :: term() | undefined,  %% Python context for affinity
     started = false :: boolean(),
     supported = unknown :: boolean() | unknown,
+    session = undefined :: term(),
     %% Per-mount tracking for multi-app mode
     mounts = #{} :: #{binary() => #mount_lifespan{}}
 }).
@@ -201,8 +203,8 @@ is_running(MountId) when is_binary(MountId) ->
 
 %% @doc Get the Python context for ASGI calls.
 %%
-%% This context provides affinity - all calls using this context
-%% share the same Python worker and module state.
+%% Retained for callers using the context API. Lifespan itself runs on the
+%% event-loop pool, not this context; this is not a loop-affinity guarantee.
 %% Uses ETS cache for fast concurrent reads (avoids gen_server bottleneck).
 -spec get_context() -> term() | undefined.
 get_context() ->
@@ -250,7 +252,9 @@ init(Opts) ->
         py_context = PyContext
     }}.
 
-handle_call({startup, Opts}, _From, #state{py_context = PyContext} = State) ->
+handle_call({startup, _Opts}, _From, #state{started = true} = State) ->
+    {reply, ok, State};
+handle_call({startup, Opts}, _From, State) ->
     AppModule = hornbeam_config:get_config(app_module),
     AppCallable = hornbeam_config:get_config(app_callable),
     LifespanMode = maps:get(lifespan, Opts, State#state.lifespan_mode),
@@ -261,9 +265,9 @@ handle_call({startup, Opts}, _From, #state{py_context = PyContext} = State) ->
             ets:insert(?CACHE_TABLE, {started, true}),
             {reply, ok, State#state{started = true, supported = false}};
         _ ->
-            %% Try to run lifespan startup with context
-            case run_startup(AppModule, AppCallable, PyContext) of
-                {ok, LifespanState} ->
+            %% Submit persistent lifespan execution to the event-loop pool
+            case run_startup(AppModule, AppCallable, undefined) of
+                {ok, LifespanState, Session} ->
                     %% Update ETS cache
                     ets:insert(?CACHE_TABLE, [
                         {lifespan_state, LifespanState},
@@ -274,6 +278,7 @@ handle_call({startup, Opts}, _From, #state{py_context = PyContext} = State) ->
                         app_callable = AppCallable,
                         lifespan_mode = LifespanMode,
                         lifespan_state = LifespanState,
+                        session = Session,
                         started = true,
                         supported = true
                     }};
@@ -297,7 +302,42 @@ handle_call({startup, Opts}, _From, #state{py_context = PyContext} = State) ->
     end;
 
 %% Per-mount startup handler
-handle_call({startup_mount, MountId, Opts}, _From, #state{py_context = PyContext, mounts = Mounts} = State) ->
+handle_call({startup_mount, MountId, Opts}, From, #state{mounts = Mounts} = State) ->
+    case maps:get(MountId, Mounts, undefined) of
+        #mount_lifespan{started = true} -> {reply, ok, State};
+        _ -> startup_mount_call(MountId, Opts, From, State)
+    end;
+
+handle_call({shutdown_mount, MountId}, _From, #state{mounts = Mounts} = State) ->
+    case maps:get(MountId, Mounts, undefined) of
+        undefined -> {reply, ok, State};
+        #mount_lifespan{started = false} -> {reply, ok, State};
+        #mount_lifespan{session = Session} = ML ->
+            Result = run_shutdown(Session),
+            ets:insert(?CACHE_TABLE, [
+                {{started, MountId}, false},
+                {{lifespan_state, MountId}, #{}}
+            ]),
+            {reply, Result, State#state{mounts = Mounts#{MountId =>
+                ML#mount_lifespan{started = false, session = undefined}}}}
+    end;
+
+handle_call(shutdown, _From, #state{started = false} = State) ->
+    {reply, ok, State};
+handle_call(shutdown, _From, #state{session = Session} = State) ->
+    Result = run_shutdown(Session),
+    ets:insert(?CACHE_TABLE, [{started, false}, {lifespan_state, #{}}]),
+    {reply, Result, State#state{started = false, lifespan_state = #{}, session = undefined}};
+handle_call(get_state, _From, #state{lifespan_state = LifespanState} = State) ->
+    {reply, LifespanState, State};
+handle_call(is_running, _From, #state{started = Started} = State) ->
+    {reply, Started, State};
+handle_call(get_context, _From, #state{py_context = PyContext} = State) ->
+    {reply, PyContext, State};
+handle_call(_Request, _From, State) ->
+    {reply, {error, unknown_request}, State}.
+
+startup_mount_call(MountId, Opts, _From, #state{mounts = Mounts} = State) ->
     AppModule = maps:get(app_module, Opts),
     AppCallable = maps:get(app_callable, Opts),
     LifespanMode = maps:get(lifespan, Opts, auto),
@@ -316,8 +356,8 @@ handle_call({startup_mount, MountId, Opts}, _From, #state{py_context = PyContext
             {reply, ok, State#state{mounts = Mounts#{MountId => MountLifespan}}};
         _ ->
             %% Try to run lifespan startup with mount_id
-            case run_startup_mount(MountId, AppModule, AppCallable, PyContext) of
-                {ok, LifespanState} ->
+            case run_startup(AppModule, AppCallable, MountId) of
+                {ok, LifespanState, Session} ->
                     %% Update ETS cache for this mount
                     ets:insert(?CACHE_TABLE, [
                         {{lifespan_state, MountId}, LifespanState},
@@ -328,7 +368,8 @@ handle_call({startup_mount, MountId, Opts}, _From, #state{py_context = PyContext
                         app_module = AppModule,
                         app_callable = AppCallable,
                         started = true,
-                        supported = true
+                        supported = true,
+                        session = Session
                     },
                     {reply, ok, State#state{mounts = Mounts#{MountId => MountLifespan}}};
                 {error, not_supported} when LifespanMode =:= auto ->
@@ -347,57 +388,7 @@ handle_call({startup_mount, MountId, Opts}, _From, #state{py_context = PyContext
                 {error, Reason} ->
                     {reply, {error, Reason}, State}
             end
-    end;
-
-%% Per-mount shutdown handler
-handle_call({shutdown_mount, MountId}, _From, #state{py_context = PyContext, mounts = Mounts} = State) ->
-    case maps:get(MountId, Mounts, undefined) of
-        undefined ->
-            {reply, ok, State};
-        #mount_lifespan{started = false} ->
-            {reply, ok, State};
-        #mount_lifespan{supported = false} = ML ->
-            ets:insert(?CACHE_TABLE, [
-                {{started, MountId}, false},
-                {{lifespan_state, MountId}, #{}}
-            ]),
-            {reply, ok, State#state{mounts = Mounts#{MountId => ML#mount_lifespan{started = false}}}};
-        #mount_lifespan{app_module = AppModule, app_callable = AppCallable} = ML ->
-            Result = run_shutdown_mount(MountId, AppModule, AppCallable, PyContext),
-            ets:insert(?CACHE_TABLE, [
-                {{started, MountId}, false},
-                {{lifespan_state, MountId}, #{}}
-            ]),
-            {reply, Result, State#state{mounts = Mounts#{MountId => ML#mount_lifespan{started = false}}}}
-    end;
-
-handle_call(shutdown, _From, #state{started = false} = State) ->
-    {reply, ok, State};
-
-handle_call(shutdown, _From, #state{supported = false} = State) ->
-    %% Update ETS cache
-    ets:insert(?CACHE_TABLE, [{started, false}, {lifespan_state, #{}}]),
-    {reply, ok, State#state{started = false}};
-
-handle_call(shutdown, _From, #state{app_module = AppModule,
-                                     app_callable = AppCallable,
-                                     py_context = PyContext} = State) ->
-    Result = run_shutdown(AppModule, AppCallable, PyContext),
-    %% Update ETS cache
-    ets:insert(?CACHE_TABLE, [{started, false}, {lifespan_state, #{}}]),
-    {reply, Result, State#state{started = false, lifespan_state = #{}}};
-
-handle_call(get_state, _From, #state{lifespan_state = LifespanState} = State) ->
-    {reply, LifespanState, State};
-
-handle_call(is_running, _From, #state{started = Started} = State) ->
-    {reply, Started, State};
-
-handle_call(get_context, _From, #state{py_context = PyContext} = State) ->
-    {reply, PyContext, State};
-
-handle_call(_Request, _From, State) ->
-    {reply, {error, unknown_request}, State}.
+    end.
 
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -414,17 +405,33 @@ handle_info({<<"update_state">>, MountId, Key, Value}, State) ->
     update_state(MountId, Key, Value),
     {noreply, State};
 
+handle_info({async_result, Ref, Result}, #state{session = {Ref, _, Channel}} = State) ->
+    py_channel:close(Channel),
+    ets:insert(?CACHE_TABLE, {started, false}),
+    error_logger:error_msg("Lifespan task exited: ~p~n", [Result]),
+    {noreply, State#state{started = false, session = undefined}};
+handle_info({async_result, Ref, Result}, #state{mounts = Mounts} = State) ->
+    NewMounts = maps:map(fun(MountId, ML) ->
+        case ML#mount_lifespan.session of
+            {Ref, _, Channel} ->
+                py_channel:close(Channel),
+                ets:insert(?CACHE_TABLE, {{started, MountId}, false}),
+                error_logger:error_msg("Mount lifespan task exited (~p): ~p~n", [MountId, Result]),
+                ML#mount_lifespan{started = false, session = undefined};
+            _ -> ML
+        end
+    end, Mounts),
+    {noreply, State#state{mounts = NewMounts}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{started = true, supported = true,
-                          app_module = AppModule,
-                          app_callable = AppCallable,
-                          py_context = PyContext}) ->
-    %% Run shutdown on terminate
-    _ = run_shutdown(AppModule, AppCallable, PyContext),
-    ok;
-terminate(_Reason, _State) ->
+terminate(_Reason, #state{session = Session, mounts = Mounts}) ->
+    %% Signal all mounts before waiting, so total termination has one deadline.
+    Sessions = [S || S <- [Session | [ML#mount_lifespan.session ||
+        ML <- maps:values(Mounts)]], S =/= undefined],
+    lists:foreach(fun({_, _, Ch}) -> py_channel:send(Ch, <<"lifespan.shutdown">>) end, Sessions),
+    Deadline = erlang:monotonic_time(millisecond) + lifespan_timeout(),
+    lists:foreach(fun(S) -> finish_shutdown(S, Deadline) end, Sessions),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -434,40 +441,72 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal Functions
 %%% ============================================================================
 
-run_startup(AppModule, AppCallable, PyContext) ->
-    %% Use lifespan_timeout for startup/shutdown, falls back to general timeout
-    TimeoutMs = case hornbeam_config:get_config(lifespan_timeout) of
+%% The pool loop keeps running after startup returns. PID affinity alone does
+%% not put requests on this same loop: loop-bound application resources require
+%% erlang_python.event_loop_pool_size = 1 in the MVP.
+run_startup(AppModule, AppCallable, MountId) ->
+    try
+        {ok, Channel} = py_channel:new(#{max_size => 1024}),
+        Session = {make_ref(), erlang:unique_integer([positive]), Channel},
+        try
+            {Ref, Token, Channel} = Session,
+            {ok, LoopRef} = py_event_loop_pool:get_loop(),
+            ok = py_nif:submit_task(LoopRef, self(), Ref,
+                <<"hornbeam_lifespan_runner">>, <<"run_lifespan">>,
+                [self(), Token, Channel, AppModule, AppCallable, MountId,
+                 lifespan_timeout()], #{}),
+            ok = py_channel:send(Channel, <<"lifespan.startup">>),
+            case await_response(Session, lifespan_timeout() + 500) of
+                {ok, Response} ->
+                    case handle_startup_response(Response) of
+                        {ok, AppState} -> {ok, AppState, Session};
+                        Error -> py_channel:close(Channel), Error
+                    end;
+                Error -> py_channel:close(Channel), Error
+            end
+        catch
+            Class:Reason ->
+                py_channel:close(Channel),
+                {error, {Class, Reason}}
+        end
+    catch
+        Class0:Reason0 -> {error, {Class0, Reason0}}
+    end.
+
+lifespan_timeout() ->
+    case hornbeam_config:get_config(lifespan_timeout) of
         undefined ->
             case hornbeam_config:get_config(timeout) of
                 undefined -> ?DEFAULT_TIMEOUT;
                 T -> T
             end;
-        LT -> LT
-    end,
-
-    try
-        %% Use context-aware call for affinity
-        %% Pass timeout to Python so it can use the same value
-        Result = case PyContext of
-            undefined ->
-                py:call(hornbeam_lifespan_runner, startup,
-                       [AppModule, AppCallable, TimeoutMs], #{});
-            CtxRef ->
-                py_nif:context_call(CtxRef, <<"hornbeam_lifespan_runner">>, <<"startup">>,
-                                   [AppModule, AppCallable, TimeoutMs], #{})
-        end,
-        case Result of
-            {ok, Response} ->
-                handle_startup_response(Response);
-            {error, StartupError} ->
-                {error, StartupError}
-        end
-    catch
-        Class:CatchReason ->
-            error_logger:error_msg("Lifespan startup error: ~p:~p~n",
-                                   [Class, CatchReason]),
-            {error, {Class, CatchReason}}
+        T -> T
     end.
+
+await_response({Ref, Token, _}, Timeout) ->
+    receive
+        {<<"lifespan">>, Token, Response} -> {ok, Response};
+        {async_result, Ref, {error, Reason}} -> {error, Reason};
+        {async_result, Ref, {ok, _}} -> {error, lifespan_exited}
+    after Timeout ->
+        {error, timeout}
+    end.
+
+run_shutdown(undefined) -> ok;
+run_shutdown({_, _, Channel} = Session) ->
+    case py_channel:send(Channel, <<"lifespan.shutdown">>) of
+        ok -> finish_shutdown(Session, erlang:monotonic_time(millisecond) + lifespan_timeout() + 500);
+        Error -> py_channel:close(Channel), {error, {shutdown_channel, Error}}
+    end.
+
+finish_shutdown({_, _, Channel} = Session, Deadline) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    Result = case await_response(Session, Remaining) of
+        {ok, Response} -> handle_shutdown_response(Response);
+        Error -> Error
+    end,
+    py_channel:close(Channel),
+    Result.
 
 handle_startup_response(Response) ->
     case maps:get(<<"type">>, Response, undefined) of
@@ -483,98 +522,14 @@ handle_startup_response(Response) ->
             {error, {invalid_response, Response}}
     end.
 
-run_shutdown(AppModule, AppCallable, PyContext) ->
-    try
-        %% Use context-aware call for affinity
-        Result = case PyContext of
-            undefined ->
-                py:call(hornbeam_lifespan_runner, shutdown,
-                       [AppModule, AppCallable], #{});
-            CtxRef ->
-                py_nif:context_call(CtxRef, <<"hornbeam_lifespan_runner">>, <<"shutdown">>,
-                                   [AppModule, AppCallable], #{})
-        end,
-        case Result of
-            {ok, Response} ->
-                handle_shutdown_response(Response);
-            {error, ShutdownError} ->
-                {error, ShutdownError}
-        end
-    catch
-        Class:CatchReason ->
-            error_logger:error_msg("Lifespan shutdown error: ~p:~p~n",
-                                   [Class, CatchReason]),
-            {error, {Class, CatchReason}}
-    end.
-
-%% @private
-%% Run lifespan startup for a specific mount (multi-app mode)
-run_startup_mount(MountId, AppModule, AppCallable, PyContext) ->
-    TimeoutMs = case hornbeam_config:get_config(lifespan_timeout) of
-        undefined ->
-            case hornbeam_config:get_config(timeout) of
-                undefined -> ?DEFAULT_TIMEOUT;
-                T -> T
-            end;
-        LT -> LT
-    end,
-
-    try
-        %% Pass mount_id to Python so it can store state per mount
-        Result = case PyContext of
-            undefined ->
-                py:call(hornbeam_lifespan_runner, startup_mount,
-                       [MountId, AppModule, AppCallable, TimeoutMs], #{});
-            CtxRef ->
-                py_nif:context_call(CtxRef, <<"hornbeam_lifespan_runner">>, <<"startup_mount">>,
-                                   [MountId, AppModule, AppCallable, TimeoutMs], #{})
-        end,
-        case Result of
-            {ok, Response} ->
-                handle_startup_response(Response);
-            {error, StartupError} ->
-                {error, StartupError}
-        end
-    catch
-        Class:CatchReason ->
-            error_logger:error_msg("Lifespan mount startup error (~s): ~p:~p~n",
-                                   [MountId, Class, CatchReason]),
-            {error, {Class, CatchReason}}
-    end.
-
-%% @private
-%% Run lifespan shutdown for a specific mount (multi-app mode)
-run_shutdown_mount(MountId, AppModule, AppCallable, PyContext) ->
-    try
-        %% Pass mount_id to Python for per-mount cleanup
-        Result = case PyContext of
-            undefined ->
-                py:call(hornbeam_lifespan_runner, shutdown_mount,
-                       [MountId, AppModule, AppCallable], #{});
-            CtxRef ->
-                py_nif:context_call(CtxRef, <<"hornbeam_lifespan_runner">>, <<"shutdown_mount">>,
-                                   [MountId, AppModule, AppCallable], #{})
-        end,
-        case Result of
-            {ok, Response} ->
-                handle_shutdown_response(Response);
-            {error, ShutdownError} ->
-                {error, ShutdownError}
-        end
-    catch
-        Class:CatchReason ->
-            error_logger:error_msg("Lifespan mount shutdown error (~s): ~p:~p~n",
-                                   [MountId, Class, CatchReason]),
-            {error, {Class, CatchReason}}
-    end.
-
 handle_shutdown_response(Response) ->
     case maps:get(<<"type">>, Response, undefined) of
         <<"lifespan.shutdown.complete">> ->
             ok;
+        <<"lifespan.shutdown.failed">> ->
+            {error, {shutdown_failed, maps:get(<<"message">>, Response, <<"Unknown error">>)}};
         _ ->
-            %% Accept any response during shutdown
-            ok
+            {error, {invalid_response, Response}}
     end.
 
 %% @private
