@@ -12,13 +12,11 @@ all() -> [scope_types, cookie, inline_bodies, large_body, response_complete,
           peer_disconnect, streaming_disconnect, request_timeout].
 
 init_per_suite(Config) ->
-    %% erlang_python 5.0.0 loses channel wakeups with concurrent pool loops.
-    %% Isolate that dependency limitation rather than masking it with sleeps.
-    OldLoopSize = application:get_env(erlang_python, event_loop_pool_size),
     _ = application:stop(hornbeam),
     _ = application:stop(erlang_python),
-    ok = application:set_env(erlang_python, event_loop_pool_size, 1),
     {ok, _} = application:ensure_all_started(hornbeam),
+    {ok, Loops} = py_event_loop_pool:get_all_loops(),
+    ct:pal("Native HTTP event-loop pool size: ~p", [length(Loops)]),
     {ok, Socket} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
     {ok, {_, Port}} = inet:sockname(Socket),
     ok = gen_tcp:close(Socket),
@@ -39,16 +37,12 @@ init_per_suite(Config) ->
         timeout => 3000,
         pythonpath => [list_to_binary(AppDir)]
     }),
-    [{port, Port}, {old_loop_size, OldLoopSize} | Config].
+    [{port, Port} | Config].
 
-end_per_suite(Config) ->
+end_per_suite(_Config) ->
     hornbeam:stop(),
     application:stop(hornbeam),
     application:stop(erlang_python),
-    case proplists:get_value(old_loop_size, Config) of
-        undefined -> application:unset_env(erlang_python, event_loop_pool_size);
-        {ok, Size} -> application:set_env(erlang_python, event_loop_pool_size, Size)
-    end,
     ok.
 
 scope_types(Config) ->
