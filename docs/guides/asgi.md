@@ -56,7 +56,19 @@ UTF-8. Duplicate headers retain their order.
 
 The final `http.request` event has `more_body=False`. Subsequent `receive()` calls
 wait for disconnect rather than returning EOF repeatedly; EOF alone is not a
-client disconnect. Concurrent pending receive calls are not supported.
+client disconnect. Response completion, peer disconnect, and request timeout
+wake pending receives with `http.disconnect`. Concurrent pending receive calls
+are not supported.
+
+With the pinned `erlang_python` 5.0.0, use a single event-loop pool entry for
+async channel reads, including disconnect notifications:
+
+```erlang
+{erlang_python, [{event_loop_pool_size, 1}]}
+```
+
+Concurrent channel waits on multiple pool loops can lose wakeups in that
+dependency version. Request-body EOF must still not be treated as disconnect.
 
 ### WebSocket Scope
 

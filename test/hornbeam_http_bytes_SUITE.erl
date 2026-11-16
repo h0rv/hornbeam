@@ -4,11 +4,20 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([all/0, init_per_suite/1, end_per_suite/1,
-         scope_types/1, cookie/1, inline_bodies/1, large_body/1]).
+         scope_types/1, cookie/1, inline_bodies/1, large_body/1,
+         response_complete/1, peer_disconnect/1, streaming_disconnect/1,
+         request_timeout/1]).
 
-all() -> [scope_types, cookie, inline_bodies, large_body].
+all() -> [scope_types, cookie, inline_bodies, large_body, response_complete,
+          peer_disconnect, streaming_disconnect, request_timeout].
 
 init_per_suite(Config) ->
+    %% erlang_python 5.0.0 loses channel wakeups with concurrent pool loops.
+    %% Isolate that dependency limitation rather than masking it with sleeps.
+    OldLoopSize = application:get_env(erlang_python, event_loop_pool_size),
+    _ = application:stop(hornbeam),
+    _ = application:stop(erlang_python),
+    ok = application:set_env(erlang_python, event_loop_pool_size, 1),
     {ok, _} = application:ensure_all_started(hornbeam),
     {ok, Socket} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
     {ok, {_, Port}} = inet:sockname(Socket),
@@ -30,11 +39,16 @@ init_per_suite(Config) ->
         timeout => 3000,
         pythonpath => [list_to_binary(AppDir)]
     }),
-    [{port, Port} | Config].
+    [{port, Port}, {old_loop_size, OldLoopSize} | Config].
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     hornbeam:stop(),
     application:stop(hornbeam),
+    application:stop(erlang_python),
+    case proplists:get_value(old_loop_size, Config) of
+        undefined -> application:unset_env(erlang_python, event_loop_pool_size);
+        {ok, Size} -> application:set_env(erlang_python, event_loop_pool_size, Size)
+    end,
     ok.
 
 scope_types(Config) ->
@@ -60,6 +74,48 @@ inline_bodies(Config) ->
 large_body(Config) ->
     %% Keep the already-correct raw ByteChannel path covered separately.
     assert_echo(Config, binary:copy(<<"café雪"/utf8>>, 12000)).
+
+response_complete(Config) ->
+    {ok, #{status := 200, body := {full, <<"ok">>}}} =
+        hornbeam_test_http:request(get, url(Config, <<"/lifecycle/wait/complete">>)),
+    await_state(Config, <<"complete">>, <<"done">>, 100).
+
+peer_disconnect(Config) ->
+    Socket = open_waiter(Config, <<"close">>),
+    ok = gen_tcp:close(Socket),
+    await_state(Config, <<"close">>, <<"done">>, 100).
+
+streaming_disconnect(Config) ->
+    Socket = open_waiter(Config, <<"stream">>),
+    {ok, _ResponseHead} = gen_tcp:recv(Socket, 0, 1000),
+    ok = gen_tcp:close(Socket),
+    await_state(Config, <<"stream">>, <<"done">>, 100).
+
+request_timeout(Config) ->
+    Socket = open_waiter(Config, <<"timeout">>),
+    try await_state(Config, <<"timeout">>, <<"done">>, 100)
+    after gen_tcp:close(Socket) end.
+
+open_waiter(Config, Name) ->
+    {ok, Socket} = gen_tcp:connect({127, 0, 0, 1},
+        proplists:get_value(port, Config), [binary, {active, false}], 1000),
+    ok = gen_tcp:send(Socket, [<<"GET /lifecycle/wait/">>, Name,
+                               <<" HTTP/1.1\r\nHost: localhost\r\n\r\n">>]),
+    await_state(Config, Name, <<"waiting">>, 100),
+    Socket.
+
+await_state(_Config, Name, Expected, 0) ->
+    ct:fail({lifecycle_state_not_reached, Name, Expected});
+await_state(Config, Name, Expected, Attempts) ->
+    {ok, #{status := 200, body := {full, State}}} = hornbeam_test_http:request(
+        get, url(Config, <<"/lifecycle/status/", Name/binary>>)),
+    case State of
+        Expected -> ok;
+        _ ->
+            case Attempts of 1 -> ct:pal("Last lifecycle state: ~p", [State]); _ -> ok end,
+            receive after 50 -> ok end,
+            await_state(Config, Name, Expected, Attempts - 1)
+    end.
 
 assert_echo(Config, Body) ->
     {ok, #{status := 200, body := {full, Echo}}} =

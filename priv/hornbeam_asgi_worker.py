@@ -158,11 +158,15 @@ class BodyReceiver:
         """Read body chunk from ByteChannel."""
         try:
             chunk = await self._channel.async_receive_bytes()
+            if self._disconnected:
+                return _DISCONNECT_MSG
             if chunk:
                 return {'type': 'http.request', 'body': chunk, 'more_body': True}
             # Empty chunk but channel still open - wait for more
             return {'type': 'http.request', 'body': b'', 'more_body': True}
         except ByteChannelClosed:
+            if self._disconnected:
+                return _DISCONNECT_MSG
             self._complete = True
             self._mode = 'done'
             return _EMPTY_BODY_MSG
@@ -244,6 +248,7 @@ class ASGIProtocol:
                 # Send fin to terminate
                 self._send_fn(self._caller_pid, b'fin')
                 self._response_finished = True
+                self._body_receiver.signal_disconnect()
 
         elif msg_type == 'http.response.informational':
             status = message.get('status', 100)
@@ -253,6 +258,7 @@ class ASGIProtocol:
 
         elif msg_type == 'http.disconnect':
             self._response_finished = True
+            self._body_receiver.signal_disconnect()
 
     async def run(self):
         """Run the ASGI application."""
@@ -288,7 +294,7 @@ class ASGIProtocol:
 # =============================================================================
 
 async def handle_asgi(caller_pid, app_module: str, app_callable: str,
-                      scope: dict, req_body_ref):
+                      scope: dict, req_body_ref, disconnect_ref=None):
     """Handle ASGI request.
 
     Entry point called from hornbeam_asgi.erl.
@@ -319,7 +325,26 @@ async def handle_asgi(caller_pid, app_module: str, app_callable: str,
 
     # Create and run protocol
     protocol = ASGIProtocol(caller_pid, app, scope, body_receiver)
-    await protocol.run()
+    if disconnect_ref is None:
+        await protocol.run()
+        return
+
+    # Closing this channel means response completion, peer disconnect, or
+    # timeout -- never merely request-body EOF. Cancel the watcher when the
+    # application returns so successful requests leave no background tasks.
+    async with asyncio.TaskGroup() as tasks:
+        watcher = tasks.create_task(_watch_disconnect(body_receiver, disconnect_ref))
+        try:
+            await protocol.run()
+        finally:
+            watcher.cancel()
+
+
+async def _watch_disconnect(body_receiver: BodyReceiver, channel_ref):
+    try:
+        await ByteChannel(channel_ref).async_receive_bytes()
+    except ByteChannelClosed:
+        body_receiver.signal_disconnect()
 
 
 # =============================================================================

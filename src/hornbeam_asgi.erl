@@ -77,17 +77,22 @@ handle(Req, HandlerState) ->
             {{channel, Ch}, livery_body:ref(Reader)}
     end,
 
+    %% Body EOF is independent of request termination. Keep a separate
+    %% close-only channel so even empty/inline bodies can observe disconnect.
+    {ok, DisconnectChannel} = py_byte_channel:new(),
+
     %% Submit task to event loop pool for parallel distribution
     {ok, LoopRef} = py_event_loop_pool:get_loop(),
     TaskRef = make_ref(),
     ok = py_nif:submit_task(LoopRef, self(), TaskRef,
         <<"hornbeam_asgi_worker">>, <<"handle_asgi">>,
-        [self(), AppModule, AppCallable, Scope, BodyArg], #{}),
+        [self(), AppModule, AppCallable, Scope, BodyArg, DisconnectChannel], #{}),
 
     St = #{
         req => Req,
         req_info => ReqInfo1,
         channel => body_channel(BodyArg),
+        disconnect_channel => DisconnectChannel,
         body_ref => BodyRef,
         timeout_ms => TimeoutMs
     },
@@ -226,6 +231,7 @@ body_channel(_) -> undefined.
 
 %% @private
 cleanup(St) ->
+    maybe_close_channel(maps:get(disconnect_channel, St, undefined)),
     maybe_close_channel(maps:get(channel, St)).
 
 %% A full body channel must not trap the request process indefinitely.

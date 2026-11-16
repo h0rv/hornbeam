@@ -7,6 +7,31 @@ from http.cookies import SimpleCookie
 Receive = Callable[[], Awaitable[dict[str, object]]]
 Send = Callable[[dict[str, object]], Awaitable[None]]
 
+# State only: no loop-affine objects, so the probes work across pool loops.
+_lifecycle: dict[str, bytes] = {}
+
+
+async def lifecycle(path: str, receive: Receive, send: Send) -> None:
+    _, _, action, name = path.split("/")
+    if action == "status":
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": _lifecycle.get(name, b"")})
+        return
+
+    event = await receive()
+    assert event["type"] == "http.request" and not event["more_body"]
+    _lifecycle[name] = b"waiting"
+    if name in {"complete", "stream"}:
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b"ok",
+                    "more_body": name == "stream"})
+    try:
+        assert await receive() == {"type": "http.disconnect"}
+        _lifecycle[name] = b"done"
+    except BaseException as exc:
+        _lifecycle[name] = repr(exc).encode()
+        raise
+
 
 def parse_headers(value: object) -> list[tuple[bytes, bytes]]:
     assert isinstance(value, list)
@@ -37,6 +62,10 @@ async def application(scope: dict[str, object], receive: Receive, send: Send) ->
     headers = parse_headers(scope["headers"])
     extensions = scope["extensions"]
     assert isinstance(extensions, dict)
+
+    if scope["path"].startswith("/lifecycle/"):
+        await lifecycle(scope["path"], receive, send)
+        return
 
     if scope["path"] == "/echo":
         chunks: list[bytes] = []

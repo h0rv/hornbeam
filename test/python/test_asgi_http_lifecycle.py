@@ -6,6 +6,30 @@ import hornbeam_asgi_worker as worker
 import pytest
 
 
+@pytest.mark.parametrize("body_ref", ["empty", ("body", b"data")])
+def test_response_completion__should_wake_pending_receive(
+    monkeypatch: pytest.MonkeyPatch, body_ref: object,
+) -> None:
+    monkeypatch.setattr(worker, "_erlang_send", lambda *args: None)
+
+    async def exercise() -> None:
+        receiver = worker.BodyReceiver(body_ref)
+        protocol = worker.ASGIProtocol(None, None, {}, receiver)
+        await protocol.receive()
+        async with asyncio.TaskGroup() as tasks:
+            pending = tasks.create_task(protocol.receive())
+            await asyncio.sleep(0)
+            await protocol.send({"type": "http.response.start", "status": 200})
+            await protocol.send({"type": "http.response.body", "more_body": True})
+            await asyncio.sleep(0)
+            assert not pending.done()
+            await protocol.send({"type": "http.response.body"})
+            assert await asyncio.wait_for(pending, 1) == {"type": "http.disconnect"}
+        assert await protocol.receive() == {"type": "http.disconnect"}
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("body_ref", ["empty", ("body", b""), ("body", b"\xff\x00")])
 def test_body_eof__should_suspend_watcher_and_allow_response(body_ref: object) -> None:
     async def exercise() -> None:
