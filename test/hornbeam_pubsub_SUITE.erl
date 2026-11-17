@@ -19,6 +19,8 @@
 -include_lib("stdlib/include/assert.hrl").
 
 -export([
+    peer_subscribers/2,
+    test_cross_node_publish/1,
     all/0,
     groups/0,
     init_per_suite/1,
@@ -54,7 +56,8 @@ groups() ->
         test_subscriber_receives_messages,
         test_unsubscribed_no_messages,
         test_binary_topic,
-        test_tuple_topic
+        test_tuple_topic,
+        test_cross_node_publish
     ]}].
 
 init_per_suite(Config) ->
@@ -282,6 +285,73 @@ test_tuple_topic(_Config) ->
 %%% ============================================================================
 %%% Helper functions
 %%% ============================================================================
+
+test_cross_node_publish(_Config) ->
+    case node() of
+        nonode@nohost ->
+            os:cmd("epmd -daemon"),
+            {ok, _} = net_kernel:start([list_to_atom(peer:random_name()), shortnames]);
+        _ -> ok
+    end,
+    Topic = <<"cross-node">>,
+    {ok, Peer, Node} = peer:start_link(#{name => peer:random_name(),
+        connection => standard_io, args => ["+S", "2", "-pa" | code:get_path()]}),
+    try
+        {ok, _} = peer:call(Peer, hornbeam_pubsub, start_link, []),
+        {Ref, []} = pg:monitor(hornbeam_pubsub_scope, Topic),
+        try
+            Remote = spawn(Node, ?MODULE, peer_subscribers, [self(), Topic]),
+            receive {ready, Remote} -> ok after 5000 -> ct:fail(peer_not_ready) end,
+            await_members(Ref, Topic, 2),
+            ok = hornbeam_pubsub:subscribe(Topic),
+            lists:foreach(fun(Bytes) ->
+                ?assertEqual(3, hornbeam_pubsub:publish(Topic, Bytes)),
+                receive {pubsub, Topic, Bytes} -> ok
+                after 5000 -> ct:fail(local_delivery_timeout) end,
+                receive {subscriber_received, Remote, Bytes} -> ok
+                after 5000 -> ct:fail(remote_plain_timeout) end,
+                receive {channel_received, Remote, Bytes} -> ok
+                after 5000 -> ct:fail(remote_channel_timeout) end
+            end, [<<>>, <<"hello">>, <<0, 255, 128>>]),
+            ?assertEqual(0, hornbeam_pubsub:publish(<<"no-members">>, ignored))
+        after
+            pg:demonitor(hornbeam_pubsub_scope, Ref),
+            hornbeam_pubsub:unsubscribe(Topic)
+        end
+    after
+        peer:stop(Peer)
+    end.
+
+await_members(_Ref, _Topic, 0) -> ok;
+await_members(Ref, Topic, Remaining) ->
+    receive
+        {Ref, join, Topic, Pids} ->
+            await_members(Ref, Topic, Remaining - length(Pids))
+    after 5000 -> ct:fail(remote_membership_timeout)
+    end.
+
+peer_subscribers(Parent, Topic) ->
+    ok = py_nif:init(),
+    {ok, _} = hornbeam_state:start_link(),
+    {ok, _} = hornbeam_services:start_link(),
+    {<<"ok">>, Channel} = hornbeam_services:call(<<"subscribe">>,
+        [self(), <<1:128>>, Topic, 1024]),
+    ok = hornbeam_pubsub:subscribe(Topic),
+    ok = py_nif:channel_register_sync_waiter(Channel),
+    Parent ! {ready, self()},
+    peer_subscriber_loop(Parent, Topic, Channel).
+
+peer_subscriber_loop(Parent, Topic, Channel) ->
+    receive
+        {pubsub, Topic, Bytes} ->
+            Parent ! {subscriber_received, self(), Bytes},
+            peer_subscriber_loop(Parent, Topic, Channel);
+        channel_data_ready ->
+            {ok, {<<"event">>, {bytes, Bytes}}} = py_nif:channel_try_receive(Channel),
+            Parent ! {channel_received, self(), Bytes},
+            ok = py_nif:channel_register_sync_waiter(Channel),
+            peer_subscriber_loop(Parent, Topic, Channel)
+    end.
 
 subscriber_loop(Parent) ->
     receive

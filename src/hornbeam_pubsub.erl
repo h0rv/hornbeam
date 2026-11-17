@@ -97,13 +97,20 @@ unsubscribe(Topic, Pid) ->
 -spec publish(Topic :: term(), Message :: term()) -> non_neg_integer().
 publish(Topic, Message) ->
     Members = pg:get_members(?SCOPE, Topic),
+    deliver_local(Topic, Message),
+    Nodes = lists:usort([node(Pid) || Pid <- Members, node(Pid) =/= node()]),
+    lists:foreach(fun(Node) ->
+        {?SERVER, Node} ! {publish, Topic, Message}
+    end, Nodes),
+    length(Members).
+
+deliver_local(Topic, Message) ->
     lists:foreach(fun(Pid) ->
         case hornbeam_services:managed_delivery(Pid, Topic, Message) of
             managed -> ok;
             unmanaged -> Pid ! {pubsub, Topic, Message}
         end
-    end, Members),
-    length(Members).
+    end, pg:get_local_members(?SCOPE, Topic)).
 
 %% @doc Get all members subscribed to a topic (all nodes).
 -spec get_members(Topic :: term()) -> [pid()].
@@ -134,6 +141,9 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Request, State) ->
     {noreply, State}.
 
+handle_info({publish, Topic, Message}, State) ->
+    deliver_local(Topic, Message),
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
