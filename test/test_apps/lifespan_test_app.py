@@ -113,9 +113,10 @@ async def handle_root(scope, receive, send):
 
     _lifespan_state["request_count"] += 1
 
-    # Increment request count in state if available
-    if "state" in scope and "request_count" in scope["state"]:
-        scope["state"]["request_count"] += 1
+    # Request state is a shallow copy; mutate the shared cache, not its keys.
+    if "state" in scope and "cache" in scope["state"]:
+        cache = scope["state"]["cache"]
+        cache["request_count"] = cache.get("request_count", 0) + 1
 
     body = b"Lifespan Test App"
 
@@ -234,10 +235,11 @@ async def handle_counter(scope, receive, send):
 
     counter_value = _lifespan_state["request_count"]
 
-    # Also track in scope state if available
+    # Request state is a shallow copy; mutate the shared cache, not its keys.
     if "state" in scope:
-        scope["state"]["request_count"] = scope["state"].get("request_count", 0) + 1
-        counter_value = scope["state"]["request_count"]
+        cache = scope["state"].setdefault("cache", {})
+        cache["request_count"] = cache.get("request_count", 0) + 1
+        counter_value = cache["request_count"]
 
     body = json.dumps({
         "counter": counter_value,
