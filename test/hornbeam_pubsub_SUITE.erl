@@ -20,6 +20,9 @@
 
 -export([
     peer_subscribers/2,
+    peer_slow_subscriber/3,
+    test_remote_overflow/1,
+    test_node_loss/1,
     test_cross_node_publish/1,
     all/0,
     groups/0,
@@ -57,7 +60,9 @@ groups() ->
         test_unsubscribed_no_messages,
         test_binary_topic,
         test_tuple_topic,
-        test_cross_node_publish
+        test_cross_node_publish,
+        test_remote_overflow,
+        test_node_loss
     ]}].
 
 init_per_suite(Config) ->
@@ -286,18 +291,22 @@ test_tuple_topic(_Config) ->
 %%% Helper functions
 %%% ============================================================================
 
-test_cross_node_publish(_Config) ->
+start_peer() ->
     case node() of
         nonode@nohost ->
             os:cmd("epmd -daemon"),
             {ok, _} = net_kernel:start([list_to_atom(peer:random_name()), shortnames]);
         _ -> ok
     end,
-    Topic = <<"cross-node">>,
     {ok, Peer, Node} = peer:start_link(#{name => peer:random_name(),
         connection => standard_io, args => ["+S", "2", "-pa" | code:get_path()]}),
+    {ok, _} = peer:call(Peer, hornbeam_pubsub, start_link, []),
+    {Peer, Node}.
+
+test_cross_node_publish(_Config) ->
+    Topic = <<"cross-node">>,
+    {Peer, Node} = start_peer(),
     try
-        {ok, _} = peer:call(Peer, hornbeam_pubsub, start_link, []),
         {Ref, []} = pg:monitor(hornbeam_pubsub_scope, Topic),
         try
             Remote = spawn(Node, ?MODULE, peer_subscribers, [self(), Topic]),
@@ -320,6 +329,101 @@ test_cross_node_publish(_Config) ->
         end
     after
         peer:stop(Peer)
+    end.
+
+test_remote_overflow(_Config) ->
+    {Peer, Node} = start_peer(),
+    try
+        lists:foreach(fun({Topic, Limit, Suspend, Count}) ->
+            {Ref, []} = pg:monitor(hornbeam_pubsub_scope, Topic),
+            try
+                Owner = spawn(Node, ?MODULE, peer_slow_subscriber, [self(), Topic, Limit]),
+                receive {ready, Owner} -> ok after 5000 -> ct:fail(peer_not_ready) end,
+                await_members(Ref, Topic, 1),
+                Relay = peer:call(Peer, erlang, whereis, [hornbeam_pubsub]),
+                case Suspend of true -> ok = sys:suspend(Relay); false -> ok end,
+                {Micros, _} = timer:tc(fun() ->
+                    lists:foreach(fun(_) -> hornbeam_pubsub:publish(Topic, <<"payload">>) end,
+                                  lists:seq(1, Count))
+                end),
+                ?assert(Micros < 5000000),
+                case Suspend of
+                    false ->
+                        {message_queue_len, Queued} = peer:call(Peer, erlang, process_info,
+                            [Relay, message_queue_len]),
+                        ?assert(Queued =< 1024);
+                    true -> ok
+                end,
+                case Suspend of true -> ok = sys:resume(Relay); false -> ok end,
+                ?assertEqual({error, unknown_request},
+                    gen_server:call({hornbeam_pubsub, Node}, barrier, 10000)),
+                ?assertEqual({message_queue_len, 0},
+                    peer:call(Peer, erlang, process_info, [Relay, message_queue_len])),
+                Owner ! {inspect, self()},
+                receive
+                    {overflow, Owner, #{closed := true, size := Size}, 0} ->
+                        ?assert(Size =< Limit),
+                        case Suspend of true -> ?assertEqual(0, Size); false -> ?assert(Size > 0) end
+                after 5000 -> ct:fail(no_overflow_cleanup)
+                end
+            after pg:demonitor(hornbeam_pubsub_scope, Ref) end
+        end, [{<<"slow-remote">>, 1024, false, 20000},
+              {<<"relay-overload">>, 1048576, true, 1100}])
+    after peer:stop(Peer) end.
+
+test_node_loss(_Config) ->
+    Topic = <<"peer-loss">>,
+    {Peer, Node} = start_peer(),
+    {Ref, []} = pg:monitor(hornbeam_pubsub_scope, Topic),
+    try
+        Remote = spawn(Node, ?MODULE, peer_subscribers, [self(), Topic]),
+        receive {ready, Remote} -> ok after 5000 -> ct:fail(peer_not_ready) end,
+        await_members(Ref, Topic, 2),
+        ok = hornbeam_pubsub:subscribe(Topic),
+        ok = peer:stop(Peer),
+        await_leaves(Ref, Topic, Node, 2),
+        ?assertEqual(1, hornbeam_pubsub:publish(Topic, still_here)),
+        receive {pubsub, Topic, still_here} -> ok
+        after 1000 -> ct:fail(local_delivery_timeout) end
+    after
+        pg:demonitor(hornbeam_pubsub_scope, Ref),
+        hornbeam_pubsub:unsubscribe(Topic),
+        catch peer:stop(Peer)
+    end.
+
+await_leaves(_Ref, _Topic, _Node, 0) -> ok;
+await_leaves(Ref, Topic, Node, Remaining) ->
+    receive
+        {Ref, leave, Topic, Pids} ->
+            await_leaves(Ref, Topic, Node,
+                Remaining - length([P || P <- Pids, node(P) =:= Node]))
+    after 5000 -> ct:fail(remote_leave_timeout)
+    end.
+
+peer_slow_subscriber(Parent, Topic, Limit) ->
+    case whereis(hornbeam_services) of
+        undefined ->
+            ok = py_nif:init(),
+            {ok, _} = hornbeam_state:start_link(),
+            {ok, _} = hornbeam_services:start_link();
+        _ -> ok
+    end,
+    {<<"ok">>, Channel} = hornbeam_services:call(<<"subscribe">>,
+        [self(), <<1:128>>, Topic, Limit]),
+    [Guardian] = hornbeam_pubsub:get_local_members(Topic),
+    ok = hornbeam_services:managed_overflow(self(), Topic),
+    ok = hornbeam_services:managed_overflow(Guardian, wrong_topic),
+    #{closed := false} = py_channel:info(Channel),
+    Mon = monitor(process, Guardian),
+    Parent ! {ready, self()},
+    receive {inspect, From} ->
+        receive {'DOWN', Mon, process, Guardian, _} -> ok
+        after 5000 -> error(guardian_not_reaped) end,
+        {<<"ok">>, <<"overflow">>} = hornbeam_services:call(<<"subscription_status">>,
+            [self(), <<1:128>>]),
+        {<<"ok">>, Active} = hornbeam_services:call(<<"subscription_count">>, []),
+        From ! {overflow, self(), py_channel:info(Channel), Active},
+        receive stop -> ok end
     end.
 
 await_members(_Ref, _Topic, 0) -> ok;

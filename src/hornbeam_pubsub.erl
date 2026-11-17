@@ -51,6 +51,7 @@
 -define(SERVER, ?MODULE).
 -define(SCOPE, hornbeam_pubsub_scope).
 -define(MANAGED_GROUP, {?MODULE, managed_guardians}).
+-define(MAX_RELAY_QUEUE, 1024).
 
 %%% ============================================================================
 %%% API
@@ -97,20 +98,26 @@ unsubscribe(Topic, Pid) ->
 -spec publish(Topic :: term(), Message :: term()) -> non_neg_integer().
 publish(Topic, Message) ->
     Members = pg:get_members(?SCOPE, Topic),
-    deliver_local(Topic, Message),
-    Nodes = lists:usort([node(Pid) || Pid <- Members, node(Pid) =/= node()]),
+    Managed = maps:from_keys(pg:get_members(?SCOPE, ?MANAGED_GROUP), true),
+    {Local, Nodes} = lists:foldl(fun(Pid, {LocalAcc, NodeAcc}) ->
+        case maps:is_key(Pid, Managed) of
+            false ->
+                Pid ! {pubsub, Topic, Message},
+                {LocalAcc, NodeAcc};
+            true when node(Pid) =:= node() -> {[Pid | LocalAcc], NodeAcc};
+            true -> {LocalAcc, NodeAcc#{node(Pid) => true}}
+        end
+    end, {[], #{}}, Members),
+    deliver_managed(Local, Topic, Message),
     lists:foreach(fun(Node) ->
         {?SERVER, Node} ! {publish, Topic, Message}
-    end, Nodes),
+    end, maps:keys(Nodes)),
     length(Members).
 
-deliver_local(Topic, Message) ->
+deliver_managed(Members, Topic, Message) ->
     lists:foreach(fun(Pid) ->
-        case hornbeam_services:managed_delivery(Pid, Topic, Message) of
-            managed -> ok;
-            unmanaged -> Pid ! {pubsub, Topic, Message}
-        end
-    end, pg:get_local_members(?SCOPE, Topic)).
+        hornbeam_services:managed_delivery(Pid, Topic, Message)
+    end, Members).
 
 %% @doc Get all members subscribed to a topic (all nodes).
 -spec get_members(Topic :: term()) -> [pid()].
@@ -142,7 +149,16 @@ handle_cast(_Request, State) ->
     {noreply, State}.
 
 handle_info({publish, Topic, Message}, State) ->
-    deliver_local(Topic, Message),
+    Managed = maps:from_keys(pg:get_local_members(?SCOPE, ?MANAGED_GROUP), true),
+    Members = [Pid || Pid <- pg:get_local_members(?SCOPE, Topic),
+                      maps:is_key(Pid, Managed)],
+    case process_info(self(), message_queue_len) of
+        {message_queue_len, Length} when Length > ?MAX_RELAY_QUEUE ->
+            lists:foreach(fun(Pid) ->
+                hornbeam_services:managed_overflow(Pid, Topic)
+            end, Members);
+        _ -> deliver_managed(Members, Topic, Message)
+    end,
     {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
