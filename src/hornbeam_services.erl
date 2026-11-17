@@ -4,7 +4,7 @@
 -module(hornbeam_services).
 -behaviour(gen_server).
 
--export([start_link/0, reset/0, callback/1, call/2, managed_delivery/3]).
+-export([start_link/0, reset/0, callback/1, call/2, managed_delivery/3, managed_overflow/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -62,16 +62,18 @@ managed_delivery(Pid, Topic, Message) ->
                 _ -> ok
             end,
             managed;
-        _ ->
-            case hornbeam_pubsub:is_managed(Pid) of
-                true -> managed;
-                false -> unmanaged
-            end
+        _ -> managed
     end.
 
 managed_lookup(Pid) ->
     try ets:lookup(?MANAGED, Pid)
     catch error:badarg -> [] end.
+
+managed_overflow(Pid, Topic) ->
+    case managed_lookup(Pid) of
+        [{Pid, Topic, Channel, Flag}] -> terminal(Pid, Channel, Flag, ?OVERFLOW);
+        _ -> ok
+    end.
 
 deliver(Pid, Channel, Flag, Message) ->
     case valid_payload(Message) of

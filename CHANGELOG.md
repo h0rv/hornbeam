@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cross-node pub/sub delivers managed subscriptions on their guardian's node,
+  so remote subscribers receive channel bytes instead of silently losing messages.
+
 - **A HEAD response over HTTP/2 or HTTP/3 crashed the handler.** The
   ASGI and WSGI producers only handled `{error, closed}` from a stream
   write, and h2/h3 answer `{error, invalid_stream_state}` when a body is
