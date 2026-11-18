@@ -220,6 +220,10 @@ The client receives automatic events when presence changes:
 - `presence_state` - Full state on join
 - `presence_diff` - Changes (joins/leaves)
 
+### Presence Across Nodes
+
+Each node owns the presences it tracks and sends changes to the other connected nodes about every 1.5 seconds. When nodes connect, they exchange their current presences, so a node that joins late, comes back from a network split or restarts sees everyone who is online. When a node stops or loses its connection, its presences leave on every node it can no longer reach. Each client receives one `presence_diff` per change, whichever node made it.
+
 ## JavaScript Client
 
 ### Socket Connection

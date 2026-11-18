@@ -35,6 +35,7 @@
     unsubscribe/1,
     unsubscribe/2,
     publish/2,
+    publish_local/2,
     get_members/1,
     get_local_members/1
 ]).
@@ -112,6 +113,18 @@ publish(Topic, Message) ->
     lists:foreach(fun(Node) ->
         {?SERVER, Node} ! {publish, Topic, Message}
     end, maps:keys(Nodes)),
+    length(Members).
+
+%% @doc Publish a message to the subscribers of a topic on this node only.
+%% Returns the number of processes the message was sent to.
+-spec publish_local(Topic :: term(), Message :: term()) -> non_neg_integer().
+publish_local(Topic, Message) ->
+    Members = pg:get_local_members(?SCOPE, Topic),
+    Managed = maps:from_keys(pg:get_local_members(?SCOPE, ?MANAGED_GROUP), true),
+    {ManagedMembers, Plain} = lists:partition(fun(Pid) -> maps:is_key(Pid, Managed) end,
+                                              Members),
+    lists:foreach(fun(Pid) -> Pid ! {pubsub, Topic, Message} end, Plain),
+    deliver_managed(ManagedMembers, Topic, Message),
     length(Members).
 
 deliver_managed(Members, Topic, Message) ->
