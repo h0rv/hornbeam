@@ -163,7 +163,7 @@ start_asgi(Scope, Opts, State) ->
                         {bytes, maps:get(<<"path">>, Scope, <<>>)}),
                     case path_to_topic(Path) of
                         undefined -> ok;
-                        Topic -> hornbeam_pubsub:subscribe(Topic, self())
+                        Topic -> hornbeam_pubsub:subscribe_path(Topic)
                     end,
                     {ok, State2};
                 {error, Reason} ->
