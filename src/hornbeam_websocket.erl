@@ -98,7 +98,6 @@ build_websocket_scope(Req, State) ->
         },
         <<"http_version">> =>
             hornbeam_request:format_http_version(livery_req:protocol(Req)),
-        <<"method">> => livery_req:method(Req),
         <<"scheme">> => WsScheme,
         <<"path">> => Path,
         <<"raw_path">> => {bytes, Path},
