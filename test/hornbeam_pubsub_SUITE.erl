@@ -95,7 +95,7 @@ end_per_testcase(_TestCase, _Config) ->
 %%% ============================================================================
 
 test_session_table_survives_registrant(_Config) ->
-    Owner = whereis(hornbeam_pubsub),
+    Owner = whereis(hornbeam_sup),
     ?assertEqual(Owner, ets:info(hornbeam_ws_sessions, owner)),
     Parent = self(),
     Session = term_to_binary(make_ref()),
@@ -106,6 +106,14 @@ test_session_table_survives_registrant(_Config) ->
     end),
     try
         receive {registered, Pid} -> ok after 5000 -> error(registration_timeout) end,
+        ?assertEqual([{Session, Pid}], ets:lookup(hornbeam_ws_sessions, Session)),
+        Pubsub = whereis(hornbeam_pubsub),
+        Monitor = erlang:monitor(process, Pubsub),
+        exit(Pubsub, kill),
+        receive {'DOWN', Monitor, process, Pubsub, killed} -> ok
+        after 5000 -> error(pubsub_exit_timeout) end,
+        await_pubsub_restart(Pubsub, 500),
+        ?assertEqual(Owner, ets:info(hornbeam_ws_sessions, owner)),
         ?assertEqual([{Session, Pid}], ets:lookup(hornbeam_ws_sessions, Session)),
         Pid ! stop,
         receive {'DOWN', Ref, process, Pid, normal} -> ok
@@ -142,13 +150,25 @@ test_concurrent_session_registration(_Config) ->
             after 5000 -> error(registration_timeout) end,
             ?assertEqual([{Session, Pid}], ets:lookup(hornbeam_ws_sessions, Session))
         end, Sessions),
-        ?assertEqual(whereis(hornbeam_pubsub), ets:info(hornbeam_ws_sessions, owner))
+        ?assertEqual(whereis(hornbeam_sup), ets:info(hornbeam_ws_sessions, owner))
     after
         lists:foreach(fun({Session, Pid, Ref}) ->
             exit(Pid, kill),
             erlang:demonitor(Ref, [flush]),
             hornbeam_websocket:unregister_session(Session)
         end, Sessions)
+    end.
+
+await_pubsub_restart(_Previous, 0) ->
+    error(pubsub_restart_timeout);
+await_pubsub_restart(Previous, Remaining) ->
+    case whereis(hornbeam_pubsub) of
+        Pid when is_pid(Pid), Pid =/= Previous ->
+            _ = sys:get_state(Pid),
+            ok;
+        _ ->
+            timer:sleep(10),
+            await_pubsub_restart(Previous, Remaining - 1)
     end.
 
 test_subscribe_unsubscribe(_Config) ->

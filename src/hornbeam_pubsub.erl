@@ -147,8 +147,6 @@ get_local_members(Topic) ->
 %%% ============================================================================
 
 init([]) ->
-    hornbeam_ws_sessions = ets:new(hornbeam_ws_sessions,
-        [named_table, public, set, {read_concurrency, true}]),
     %% Start pg scope for hornbeam pubsub
     %% pg:start returns {ok, Pid} or {error, {already_started, Pid}}
     case pg:start(?SCOPE) of

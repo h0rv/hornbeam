@@ -39,6 +39,8 @@ start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 init([]) ->
+    hornbeam_ws_sessions = ets:new(hornbeam_ws_sessions,
+        [named_table, public, set, {read_concurrency, true}]),
     SupFlags = #{
         strategy => one_for_one,
         intensity => 10,
