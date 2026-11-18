@@ -7,6 +7,7 @@ native_byte_conversion_test() ->
     {ok, Context, _} = py_nif:context_create(worker),
     {ok, State} = hornbeam_state:start_link(),
     {ok, Pubsub} = hornbeam_pubsub:start_link(),
+    {ok, Presence} = hornbeam_presence:start_link(),
     {ok, Services} = hornbeam_services:start_link(),
     try
         ok = py_nif:context_exec(Context, <<"import erlang">>),
@@ -34,8 +35,28 @@ native_byte_conversion_test() ->
         end, [{<<"cache_set">>, [<<"n">>, <<"k">>, <<>>, -1]},
               {<<"cache_delete">>, [<<"n">>, <<"k">>]},
               {<<"cache_clear">>, [<<"n">>]},
-              {<<"unsubscribe">>, [self(), <<1:128>>]}])
+              {<<"unsubscribe">>, [self(), <<1:128>>]}]),
+        {<<"ok">>, PresenceChannel} = hornbeam_services:call(<<"presence">>,
+            [self(), <<2:128>>, <<"online">>, <<"tab">>, <<0, 255, "text">>, 65536]),
+        ready(PresenceChannel, erlang:monotonic_time(millisecond) + 3000),
+        ?assertEqual({ok, true}, py_nif:context_eval(Context,
+            <<"(lambda snapshot, expected: snapshot[0] in ('presence', b'presence') "
+              "and snapshot[1][0][0] in ('tab', b'tab') "
+              "and type(snapshot[1][0][2]) is bytes "
+              "and snapshot[1][0][2] == expected)(erlang._channel_try_receive(channel), expected)">>,
+            #{<<"channel">> => PresenceChannel, <<"expected">> => {bytes, <<0, 255, "text">>}}))
     after
-        gen_server:stop(Services), gen_server:stop(Pubsub), gen_server:stop(State),
+        gen_server:stop(Services), gen_server:stop(Presence),
+        gen_server:stop(Pubsub), gen_server:stop(State),
         gen_server:stop(hornbeam_pubsub_scope), py_nif:context_destroy(Context)
+    end.
+
+ready(Channel, Deadline) ->
+    case py_channel:info(Channel) of
+        #{size := Size} when Size > 0 -> ok;
+        _ ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true -> receive after 1 -> ready(Channel, Deadline) end;
+                false -> error(snapshot_timeout)
+            end
     end.

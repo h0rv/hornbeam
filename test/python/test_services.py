@@ -15,6 +15,7 @@ from hornbeam.api.errors import (
 )
 from hornbeam.services._wire import byte_value, integer
 from hornbeam.services.client import Beam as NativeBeam
+from hornbeam.services.presence import PresenceEntry, presence_event
 from hornbeam.services.subscription import Subscription
 from hypothesis import given
 from hypothesis import strategies as st
@@ -827,3 +828,85 @@ async def test_invalid_budget_does_not_open(max_bytes: int) -> None:
         async with Beam(bridge, owner="o").subscribe("updates", max_bytes=max_bytes):
             pass
     assert bridge.calls == []
+
+
+class PresenceBridge(TestDoubleBridge):
+    __test__ = False
+
+    async def call(self, action: str, args: list[object]) -> object:
+        if action != "presence":
+            return await super().call(action, args)
+        self.calls.append((action, args.copy()))
+        response = await super().call("subscribe", [args[0], args[1], args[2], args[5]])
+        channel = self.channels[byte_value(args[1])]
+        channel.queue.put_nowait((b"presence", [(args[3], b"ref", args[4])]))
+        return response
+
+
+@given(st.binary(max_size=4096))
+def test_presence__owned_snapshots_preserve_bytes(payload: bytes) -> None:
+    async def run() -> None:
+        bridge = PresenceBridge()
+        beam = Beam(bridge, owner="application").for_scope(
+            {"extensions": {"hornbeam.owner": "tab"}}
+        )
+        async with beam.presence("online", "tab:1", payload) as subscription:
+            assert await subscription.receive() == (PresenceEntry("tab:1", "ref", payload),)
+            assert bridge.calls[0][0] == "presence"
+            assert bridge.calls[0][1][0] == "tab"
+            assert bridge.calls[0][1][5] == 65536
+            channel = only_channel(bridge)
+            channel.queue.put_nowait((b"presence", []))
+            assert await anext(subscription) == ()
+            assert channel.native_only == [True, True]
+        assert [action for action, _ in bridge.calls[-2:]] == [
+            "unsubscribe",
+            "subscription_finalize",
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("max_bytes", [0, 1023, 1048577])
+def test_presence__invalid_budget_does_not_open(max_bytes: int) -> None:
+    bridge = PresenceBridge()
+    with pytest.raises(ValueError, match="max_bytes"):
+        Beam(bridge, owner="tab").presence("online", "tab:1", b"", max_bytes=max_bytes)
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize(("topic", "key"), [("", "tab"), ("online", ""), ("online", "x" * 1025)])
+def test_presence__invalid_names_do_not_open(topic: str, key: str) -> None:
+    bridge = PresenceBridge()
+    with pytest.raises(ValueError):
+        Beam(bridge, owner="tab").presence(topic, key, b"")
+    assert bridge.calls == []
+
+
+async def test_presence__overflow_is_not_normal_completion() -> None:
+    bridge = PresenceBridge()
+    async with Beam(bridge, owner="tab").presence("online", "tab:1", b"") as subscription:
+        await subscription.receive()
+        token = next(iter(bridge.channels))
+        bridge.states[token] = b"overflow"
+        only_channel(bridge).close()
+        with pytest.raises(SubscriptionOverflow):
+            await anext(subscription)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        (b"event", []),
+        (b"presence", ()),
+        (b"presence", [()]),
+        (b"presence", [(b"key", b"ref", "text")]),
+        (b"presence", [(b"\xff", b"ref", b"")]),
+        (b"presence", [(b"key", b"", b"")]),
+        (b"presence", [(b"key", b"ref", b"x" * 65537)]),
+    ],
+)
+def test_presence__malformed_snapshot_is_rejected(raw: object) -> None:
+    with pytest.raises(RuntimeProtocolError):
+        presence_event(raw)

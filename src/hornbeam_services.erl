@@ -57,8 +57,9 @@ call(_, _) -> failure(<<"invalid_arguments">>).
 managed_delivery(Pid, Topic, Message) ->
     case managed_lookup(Pid) of
         [{Pid, Topic, Channel, Flag}] ->
-            case atomics:get(Flag, 1) of
-                ?OPEN -> deliver(Pid, Channel, Flag, Message);
+            case {atomics:get(Flag, 1), atomics:get(Flag, 3), Message} of
+                {?OPEN, 1, {presence_diff, _}} -> presence_changed(Pid, Flag);
+                {?OPEN, 0, _} -> deliver(Pid, Channel, Flag, Message);
                 _ -> ok
             end,
             managed;
@@ -251,7 +252,17 @@ dispatch(<<"subscribe">>, [Owner, Token, Topic, MaxBytes], State)
              is_binary(Token), byte_size(Token) =:= 16,
              is_integer(MaxBytes), MaxBytes >= 1024, MaxBytes =< 1048576 ->
     case valid_topic(Topic) of
-        true -> subscribe(Owner, Token, Topic, MaxBytes, State);
+        true -> subscribe(Owner, Token, Topic, MaxBytes, bytes, State);
+        false -> {failure(<<"invalid_arguments">>), State}
+    end;
+dispatch(<<"presence">>, [Owner, Token, Topic, Key, Payload, MaxBytes], State)
+        when is_pid(Owner), node(Owner) =:= node(),
+             is_binary(Token), byte_size(Token) =:= 16,
+             is_binary(Key), byte_size(Key) > 0, byte_size(Key) =< 1024,
+             is_integer(MaxBytes), MaxBytes >= 1024, MaxBytes =< 1048576 ->
+    case valid_topic(Topic) andalso valid_payload(Payload) of
+        true -> subscribe(Owner, Token, Topic, MaxBytes,
+                          {presence, binary:copy(Key), binary:copy(Payload)}, State);
         false -> {failure(<<"invalid_arguments">>), State}
     end;
 dispatch(<<"unsubscribe">>, [Owner, Token], State)
@@ -330,7 +341,7 @@ entry_size(missing) -> 0;
 entry_size({B, _}) -> byte_size(B).
 now_ms() -> erlang:monotonic_time(millisecond).
 
-subscribe(Owner, Token, Topic, MaxBytes, State) ->
+subscribe(Owner, Token, Topic, MaxBytes, Kind, State) ->
     case token_entry(Owner, Token, State) of
         #{flag := F, channel := Ch} ->
             case atomics:get(F, 1) of
@@ -352,21 +363,22 @@ subscribe(Owner, Token, Topic, MaxBytes, State) ->
                     end, 0, Tokens),
                     case Active < ?MAX_OWNER_ACTIVE andalso
                             map_size(Reserved#state.guardians) < ?MAX_ACTIVE of
-                        true -> open_channel(Owner, Token, Topic, MaxBytes, Reserved);
+                        true -> open_channel(Owner, Token, Topic, MaxBytes, Kind, Reserved);
                         false -> {failure(<<"subscription_quota">>), Reserved}
                     end
             end
     end.
 
-open_channel(Owner, Token, Topic0, MaxBytes, State) ->
+open_channel(Owner, Token, Topic0, MaxBytes, Kind, State) ->
     Topic = binary:copy(Topic0),
     case py_channel:new(#{max_size => MaxBytes}) of
         {ok, Channel} ->
-            Flag = atomics:new(1, [{signed, false}]),
+            Flag = atomics:new(3, [{signed, false}]),
             atomics:put(Flag, 1, ?OPEN),
+            case Kind of {presence, _, _} -> atomics:put(Flag, 3, 1); bytes -> ok end,
             Service = self(),
             {Pid, Ref} = spawn_monitor(fun() ->
-                guardian(Service, Owner, Topic, Channel, Flag)
+                guardian(Service, Owner, Topic, Channel, Flag, MaxBytes)
             end),
             Entry = #{owner => Owner, token => binary:copy(Token), topic => Topic,
                       max_bytes => MaxBytes, channel => Channel, flag => Flag, pid => Pid},
@@ -374,9 +386,44 @@ open_channel(Owner, Token, Topic0, MaxBytes, State) ->
             ets:insert(?MANAGED, {Pid, Topic, Channel, Flag}),
             ok = hornbeam_pubsub:subscribe_managed(Topic, Pid),
             Next = put_token(Owner, Token, Entry, State),
-            {success(Channel), Next#state{guardians =
-                (Next#state.guardians)#{Ref => Entry}}};
+            Opened = Next#state{guardians = (Next#state.guardians)#{Ref => Entry}},
+            case register_presence(Kind, Topic, Pid) of
+                ok -> {success(Channel), Opened};
+                {error, _} -> {failure(<<"unavailable">>), finish_entry(Entry, ?CLOSED, Opened)}
+            end;
         {error, _} -> {failure(<<"channel_unavailable">>), State}
+    end.
+
+register_presence(bytes, _, _) -> ok;
+register_presence({presence, Key, Payload}, Topic, Pid) ->
+    try hornbeam_presence:track(Topic, Pid, Key, #{<<"hornbeam_services_payload">> => Payload}) of
+        ok -> ok;
+        Error -> Error
+    catch exit:Reason -> {error, Reason} end.
+
+%% Coalesce diffs before the guardian mailbox, not after an unbounded enqueue.
+presence_changed(Pid, Flag) ->
+    case atomics:compare_exchange(Flag, 2, 0, 1) of
+        ok -> Pid ! presence_changed, ok;
+        _ -> ok
+    end.
+
+presence_snapshot(Topic, Channel, Flag, MaxBytes) ->
+    atomics:put(Flag, 2, 0),
+    Entries = lists:sort([
+        {Key, Ref, {bytes, Payload}}
+        || {Key, #{<<"metas">> := Metas}} <- maps:to_list(hornbeam_presence:list(Topic)),
+           #{<<"hb_ref">> := Ref, <<"hornbeam_services_payload">> := Payload} <- Metas
+    ]),
+    Frame = {<<"presence">>, Entries},
+    case erlang:external_size(Frame) =< MaxBytes of
+        false -> terminal(self(), Channel, Flag, ?OVERFLOW);
+        true ->
+            case py_channel:send(Channel, Frame) of
+                ok -> ok;
+                busy -> terminal(self(), Channel, Flag, ?OVERFLOW);
+                {error, _} -> terminal(self(), Channel, Flag, ?CLOSED)
+            end
     end.
 
 unsubscribe(Owner, Token, State) ->
@@ -476,27 +523,52 @@ close_entry(#{pid := Pid, topic := Topic, channel := Channel, flag := Flag}, Rea
     py_channel:close(Channel),
     %% Leave is synchronous: explicit unsubscribe is acknowledged only after it.
     leave(Topic, Pid),
+    untrack_presence(Topic, Pid, Flag),
     Pid ! subscription_terminal,
     ok.
 
-guardian(Service, Owner, Topic, Channel, Flag) ->
+guardian(Service, Owner, Topic, Channel, Flag, MaxBytes) ->
     ServiceRef = monitor(process, Service),
     OwnerRef = monitor(process, Owner),
-    guardian_loop(ServiceRef, OwnerRef, Topic, Channel, Flag).
-guardian_loop(ServiceRef, OwnerRef, Topic, Channel, Flag) ->
+    PresenceRef = case atomics:get(Flag, 3) of
+        1 -> monitor(process, {hornbeam_presence, node()});
+        0 -> undefined
+    end,
+    guardian_loop(ServiceRef, OwnerRef, PresenceRef, Topic, Channel, Flag, MaxBytes).
+guardian_loop(ServiceRef, OwnerRef, PresenceRef, Topic, Channel, Flag, MaxBytes) ->
     receive
         {'DOWN', OwnerRef, process, _, _} ->
             guardian_close(Topic, Channel, Flag, ?OWNER_DOWN);
         {'DOWN', ServiceRef, process, _, _} ->
             guardian_close(Topic, Channel, Flag, ?CLOSED);
+        {'DOWN', PresenceRef, process, _, _} ->
+            guardian_close(Topic, Channel, Flag, ?CLOSED);
         subscription_terminal -> guardian_close(Topic, Channel, Flag, ?CLOSED);
-        _ -> guardian_loop(ServiceRef, OwnerRef, Topic, Channel, Flag)
+        presence_changed ->
+            case atomics:get(Flag, 1) of
+                ?OPEN -> presence_snapshot(Topic, Channel, Flag, MaxBytes);
+                _ -> ok
+            end,
+            guardian_loop(ServiceRef, OwnerRef, PresenceRef, Topic, Channel, Flag, MaxBytes);
+        _ -> guardian_loop(ServiceRef, OwnerRef, PresenceRef, Topic, Channel, Flag, MaxBytes)
     end.
 guardian_close(Topic, Channel, Flag, Reason) ->
     _ = atomics:compare_exchange(Flag, 1, ?OPEN, Reason),
     py_channel:close(Channel),
     leave(Topic, self()),
+    untrack_presence(Topic, self(), Flag),
     ok.
+
+untrack_presence(Topic, Pid, Flag) ->
+    case atomics:get(Flag, 3) of
+        0 -> ok;
+        1 ->
+            try
+                ok = hornbeam_presence:untrack_all(Topic, Pid),
+                _ = hornbeam_presence:list(Topic),
+                ok
+            catch exit:_ -> ok end
+    end.
 
 leave(Topic, Pid) ->
     try hornbeam_pubsub:unsubscribe(Topic, Pid)

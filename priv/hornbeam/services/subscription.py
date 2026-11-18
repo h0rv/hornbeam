@@ -1,4 +1,5 @@
 import asyncio
+from abc import ABC, abstractmethod
 from types import TracebackType
 from typing import TYPE_CHECKING, NoReturn, Self
 
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
     from erlang import Channel
 
 
-class Subscription:
+class _OwnedSubscription[T](ABC):
     """One owned native channel with at most one pending receive."""
 
     def __init__(
@@ -38,12 +39,18 @@ class Subscription:
         self._token = token
         self._timeout = timeout
         self._channel: Channel | None = None
-        self._pending: asyncio.Task[bytes] | None = None
+        self._pending: asyncio.Task[T] | None = None
         self._receiving = False
         self._closed = False
         self._terminal: Status = "open"
         self._cleanup: asyncio.Task[None] | None = None
         self._retirement: asyncio.Task[None] | None = None
+
+    @abstractmethod
+    def _open_call(self) -> tuple[str, list[object]]: ...
+
+    @abstractmethod
+    def _decode(self, raw: object) -> T: ...
 
     async def __aenter__(self) -> Self:
         from erlang import Channel, async_call
@@ -52,13 +59,8 @@ class Subscription:
             raise SubscriptionClosed("subscription context cannot be reused")
         self._entered = True
         try:
-            resource = result(
-                await async_call(
-                    "hornbeam_services",
-                    "subscribe",
-                    [self._owner, self._token, self._topic, self._max_bytes],
-                )
-            )
+            action, args = self._open_call()
+            resource = result(await async_call("hornbeam_services", action, args))
             self._channel = Channel(resource)
             if self._closed:
                 await self.aclose()
@@ -84,7 +86,7 @@ class Subscription:
             raise RuntimeProtocolError("subscription received an invalid payload")
         raise SubscriptionClosed("subscription is closed")
 
-    async def receive(self) -> bytes:
+    async def receive(self) -> T:
         if self._receiving:
             raise RuntimeError("only one pending receive is permitted per subscription")
         if self._closed:
@@ -106,7 +108,7 @@ class Subscription:
             self._pending = None
             self._receiving = False
 
-    async def _receive(self, channel: Channel) -> bytes:
+    async def _receive(self, channel: Channel) -> T:
         from erlang import ChannelClosed, async_call
 
         try:
@@ -127,12 +129,12 @@ class Subscription:
             self._raise_closed()
         if self._closed:
             self._raise_closed()
-        return event(raw)
+        return self._decode(raw)
 
     def __aiter__(self) -> Self:
         return self
 
-    async def __anext__(self) -> bytes:
+    async def __anext__(self) -> T:
         try:
             return await self.receive()
         except SubscriptionClosed:
@@ -190,3 +192,13 @@ class Subscription:
         if self._cleanup is None:
             self._cleanup = asyncio.create_task(self._close())
         await await_cleanup(self._cleanup)
+
+
+class Subscription(_OwnedSubscription[bytes]):
+    """One owned byte stream with at most one pending receive."""
+
+    def _open_call(self) -> tuple[str, list[object]]:
+        return "subscribe", [self._owner, self._token, self._topic, self._max_bytes]
+
+    def _decode(self, raw: object) -> bytes:
+        return event(raw)
