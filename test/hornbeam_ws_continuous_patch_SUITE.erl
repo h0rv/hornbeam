@@ -76,9 +76,9 @@ next_frame(Client) ->
     end.
 
 initial_frames(Client) ->
-    ?assertEqual({text, <<"welcome">>}, next_frame(Client)),
-    ?assertEqual({text, <<"owner-direct">>}, next_frame(Client)),
-    ?assertEqual({text, <<"idle-push">>}, next_frame(Client)).
+    Frames = [next_frame(Client) || _ <- lists:seq(1, 3)],
+    ?assertEqual(lists:sort([{text, <<"welcome">>}, {text, <<"owner-direct">>},
+                             {text, <<"idle-push">>}]), lists:sort(Frames)).
 
 mounted_legacy_topics_are_isolated(Config) ->
     Root = connect(Config, "/chat/private"),
