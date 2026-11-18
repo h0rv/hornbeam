@@ -82,8 +82,7 @@ handle(Req, HandlerState) ->
     end,
 
     {ok, LoopRef} = hornbeam_lifespan:get_loop(maps:get(mount_id, HandlerState, undefined)),
-    TaskRef = make_ref(),
-    ok = py_nif:submit_task(LoopRef, self(), TaskRef,
+    ok = py_nif:submit_task(LoopRef, self(), undefined,
         <<"hornbeam_asgi_worker">>, <<"handle_asgi">>,
         [self(), AppModule, AppCallable, Scope, BodyArg], #{}),
 
