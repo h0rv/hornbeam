@@ -155,7 +155,9 @@ start_asgi(Scope, Opts, State) ->
             case submit_asgi(Scope, Opts, State1) of
                 {ok, State2} ->
                     %% Keep the legacy path-based pubsub API in ASGI mode.
-                    case path_to_topic(maps:get(<<"path">>, Scope, <<>>)) of
+                    {bytes, Path} = maps:get(<<"raw_path">>, Scope,
+                        {bytes, maps:get(<<"path">>, Scope, <<>>)}),
+                    case path_to_topic(Path) of
                         undefined -> ok;
                         Topic -> hornbeam_pubsub:subscribe(Topic, self())
                     end,
