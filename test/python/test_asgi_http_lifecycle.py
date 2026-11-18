@@ -166,7 +166,10 @@ def test_streaming_send__should_raise_oserror_once_client_is_gone(
     assert len(fake.calls) == 1
 
 
-def test_single_body_response__should_not_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("body", [b"", b"\xff\x00"])
+def test_single_body_response__should_send_one_message(
+    monkeypatch: pytest.MonkeyPatch, body: bytes,
+) -> None:
     fake = FakeErlang(written=True)
     monkeypatch.setattr(worker, "erlang", fake)
     sent: list[object] = []
@@ -174,8 +177,10 @@ def test_single_body_response__should_not_wait(monkeypatch: pytest.MonkeyPatch) 
 
     async def exercise() -> None:
         await proto.send({"type": "http.response.start", "status": 200, "headers": []})
-        await proto.send({"type": "http.response.body", "body": b"ok"})
+        await proto.send({"type": "http.response.body", "body": body})
+        with pytest.raises(RuntimeError, match="already completed"):
+            await proto.send({"type": "http.response.body", "body": b"extra"})
 
     asyncio.run(exercise())
     assert fake.calls == []
-    assert sent == [(b"start_response", 200, [], b"ok"), b"fin"]
+    assert sent == [(b"full_response", 200, [], body)]

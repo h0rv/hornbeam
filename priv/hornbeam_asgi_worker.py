@@ -218,8 +218,8 @@ class ASGIProtocol:
     async def send(self, message: dict) -> None:
         """ASGI send callable with simplified protocol.
 
-        Uses 3 message types:
-        - start_response: headers + first chunk
+        - full_response: headers + complete body
+        - start_response: headers + first streaming chunk
         - chunk: subsequent body chunks
         - fin: end of response
         """
@@ -251,14 +251,15 @@ class ASGIProtocol:
                 raise ClientDisconnected("client disconnected")
 
             if self._headers is not None:
-                # First body - send start_response with headers + first chunk
-                start = (b'start_response', self._status, self._headers, body)
+                headers = self._headers
                 self._headers = None
                 if more_body:
-                    await self._output(start)
+                    await self._output((b'start_response', self._status, headers, body))
                 else:
-                    self._send_fn(self._caller_pid, start)
-            elif body:
+                    self._send_fn(self._caller_pid, (b'full_response', self._status, headers, body))
+                    self._response_finished = True
+                return
+            if body:
                 # Subsequent chunk
                 if more_body:
                     await self._output((b'chunk', body))
@@ -299,13 +300,11 @@ class ASGIProtocol:
                 if not self._response_started:
                     # No response started - send error response
                     self._send_fn(self._caller_pid,
-                                 (b'start_response', 500, [], b''))
-                    self._send_fn(self._caller_pid, b'fin')
+                                 (b'full_response', 500, [], b''))
                 elif self._headers is not None:
                     # Headers buffered but no body sent - send empty response
                     self._send_fn(self._caller_pid,
-                                 (b'start_response', self._status, self._headers, b''))
-                    self._send_fn(self._caller_pid, b'fin')
+                                 (b'full_response', self._status, self._headers, b''))
                 else:
                     # Streaming was started but not finished - send fin
                     self._send_fn(self._caller_pid, b'fin')

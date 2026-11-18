@@ -253,8 +253,11 @@ make_url(Config, Path) ->
 
 test_hello_world(Config) ->
     Url = make_url(Config, <<"/">>),
-    {ok, #{status := 200, body := {full, Body}}} = hornbeam_test_http:request(get, Url, #{}),
-    ?assertEqual(<<"Hello from ASGI Test App!\n">>, Body).
+    {ok, #{status := 200, body := {full, Body}} = Resp} =
+        hornbeam_test_http:request(get, Url, #{}),
+    ?assertEqual(<<"Hello from ASGI Test App!\n">>, Body),
+    ?assertEqual(integer_to_binary(byte_size(Body)), livery_client:header(<<"content-length">>, Resp)),
+    ?assertEqual(undefined, livery_client:header(<<"transfer-encoding">>, Resp)).
 
 test_not_found(Config) ->
     Url = make_url(Config, <<"/nonexistent">>),
