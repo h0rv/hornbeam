@@ -29,6 +29,8 @@ async def application(scope, receive, send):
         return
 
     path = scope.get('path', '/')
+    if path == '/uncaught':
+        raise ValueError("Intentional uncaught exception")
 
     try:
         # Route to appropriate handler

@@ -41,8 +41,8 @@
 
 -spec handle(livery_req:req(), map()) -> livery_resp:resp().
 handle(Req, HandlerState) ->
-    ReqInfo = hornbeam_handler:build_request_info(Req, HandlerState),
-    ReqInfo1 = hornbeam_http_hooks:run_on_request(ReqInfo),
+    ReqInfo = hornbeam_http_hooks:run_on_request(
+        fun() -> hornbeam_handler:build_request_info(Req, HandlerState) end),
 
     AppModule = maps:get(app_module, HandlerState),
     AppCallable = maps:get(app_callable, HandlerState),
@@ -88,7 +88,7 @@ handle(Req, HandlerState) ->
 
     St = #{
         req => Req,
-        req_info => ReqInfo1,
+        req_info => ReqInfo,
         channel => body_channel(BodyArg),
         body_ref => BodyRef,
         timeout_ms => TimeoutMs
