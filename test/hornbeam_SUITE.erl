@@ -38,6 +38,7 @@
     test_ssl_missing_certfile/1,
     test_websocket_compress_config/1,
     test_hooks_on_request/1,
+    test_hooks_deferred_info/1,
     test_hooks_on_response/1,
     test_hooks_on_error/1,
     test_hooks_exception_handling/1,
@@ -57,6 +58,7 @@ groups() ->
         test_ssl_missing_certfile,
         test_websocket_compress_config,
         test_hooks_on_request,
+        test_hooks_deferred_info,
         test_hooks_on_response,
         test_hooks_on_error,
         test_hooks_exception_handling,
@@ -220,6 +222,29 @@ test_hooks_on_request(_Config) ->
     Result2 = hornbeam_http_hooks:run_on_request(Request2),
     ?assertEqual(true, maps:get(modified, Result2)),
     ?assertEqual(<<"POST">>, maps:get(method, Result2)).
+
+test_hooks_deferred_info(_Config) ->
+    Build = fun() -> self() ! built_info, #{path => <<"/original">>} end,
+    OnError = fun(_, #{path := Path}) -> {503, Path} end,
+    OnRequest = fun(Request) -> Request#{path := <<"/changed">>} end,
+    try
+        hornbeam_http_hooks:clear(),
+        ?assertEqual(Build, hornbeam_http_hooks:run_on_request(Build)),
+        ?assertMatch({500, _}, hornbeam_http_hooks:run_on_error(failed, Build)),
+        receive built_info -> ct:fail(unnecessary_request_info) after 0 -> ok end,
+
+        hornbeam_http_hooks:set_hooks(#{on_error => OnError}),
+        ?assertEqual({503, <<"/original">>}, hornbeam_http_hooks:run_on_error(failed, Build)),
+        receive built_info -> ok after 0 -> ct:fail(missing_request_info) end,
+
+        hornbeam_http_hooks:set_hooks(#{on_request => OnRequest, on_error => OnError}),
+        Info = hornbeam_http_hooks:run_on_request(Build),
+        ?assertEqual({503, <<"/changed">>}, hornbeam_http_hooks:run_on_error(failed, Info)),
+        receive built_info -> ok after 0 -> ct:fail(missing_request_info) end,
+        receive built_info -> ct:fail(duplicate_request_info) after 0 -> ok end
+    after
+        hornbeam_http_hooks:clear()
+    end.
 
 test_hooks_on_response(_Config) ->
     %% Initialize hooks

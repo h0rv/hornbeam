@@ -57,6 +57,8 @@
 -define(HOOK_ON_RESPONSE, {?MODULE, on_response}).
 -define(HOOK_ON_ERROR, {?MODULE, on_error}).
 
+-type request_info() :: map() | fun(() -> map()).
+
 %% @doc Set the HTTP hooks configuration.
 %% Stores individual hooks in persistent_term with direct keys.
 %% Stores undefined when no hook is configured for zero-overhead check.
@@ -92,20 +94,23 @@ get_hooks() ->
 
 %% @doc Run the on_request hook.
 %% The hook receives a request map and should return a (possibly modified) request map.
-%% If no hook is configured, returns the request unchanged.
--spec run_on_request(map()) -> map().
-run_on_request(Request) when is_map(Request) ->
+%% A request builder is called only when a hook needs the map. If no hook
+%% is configured, returns the original map or builder unchanged.
+-spec run_on_request(map()) -> map();
+                    (fun(() -> map())) -> request_info().
+run_on_request(Request) when is_map(Request); is_function(Request, 0) ->
     case persistent_term:get(?HOOK_ON_REQUEST, undefined) of
         undefined ->
             Request;
         Hook when is_function(Hook, 1) ->
+            Info = request_info(Request),
             try
-                Hook(Request)
+                Hook(Info)
             catch
                 Class:Reason:Stack ->
                     error_logger:error_msg("on_request hook error: ~p:~p~n~p~n",
                                            [Class, Reason, Stack]),
-                    Request
+                    Info
             end
     end.
 
@@ -132,7 +137,7 @@ run_on_response(Response) when is_map(Response) ->
 %% The hook receives an error term and request map, and should return
 %% {StatusCode, Body} for the error response.
 %% If no hook is configured, returns a default 500 error.
--spec run_on_error(term(), map()) -> {integer(), binary()}.
+-spec run_on_error(term(), request_info()) -> {integer(), binary()}.
 run_on_error(Error, Request) ->
     case persistent_term:get(?HOOK_ON_ERROR, undefined) of
         undefined ->
@@ -140,7 +145,7 @@ run_on_error(Error, Request) ->
             {500, <<"Internal Server Error">>};
         Hook when is_function(Hook, 2) ->
             try
-                case Hook(Error, Request) of
+                case Hook(Error, request_info(Request)) of
                     {Code, Body} when is_integer(Code), is_binary(Body) ->
                         {Code, Body};
                     {Code, Body} when is_integer(Code), is_list(Body) ->
@@ -157,3 +162,6 @@ run_on_error(Error, Request) ->
                     {500, <<"Internal Server Error">>}
             end
     end.
+
+request_info(Build) when is_function(Build, 0) -> Build();
+request_info(Info) -> Info.

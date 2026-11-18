@@ -99,7 +99,8 @@
 
 %% Error handling tests
 -export([
-    test_error_exception/1
+    test_error_exception/1,
+    test_error_hook_request_info/1
 ]).
 
 all() ->
@@ -166,7 +167,8 @@ groups() ->
         test_streaming_chunks
     ]},
     {errors, [sequence], [
-        test_error_exception
+        test_error_exception,
+        test_error_hook_request_info
     ]}].
 
 init_per_suite(Config) ->
@@ -592,3 +594,19 @@ test_error_exception(Config) ->
     Url = make_url(Config, <<"/error?type=exception">>),
     {ok, #{status := 500, body := {full, Body}}} = hornbeam_test_http:request(get, Url, #{}),
     ?assert(binary:match(Body, <<"Internal Server Error">>) =/= nomatch).
+
+test_error_hook_request_info(Config) ->
+    Url = make_url(Config, <<"/uncaught">>),
+    Hooks = hornbeam_http_hooks:get_hooks(),
+    OnError = fun(_, #{path := Path}) -> {503, Path} end,
+    try
+        hornbeam_http_hooks:set_hooks(#{on_error => OnError}),
+        ?assertMatch({ok, #{status := 503, body := {full, <<"/uncaught">>}}},
+                     hornbeam_test_http:request(get, Url, #{})),
+        OnRequest = fun(Info) -> Info#{path := <<"/changed">>} end,
+        hornbeam_http_hooks:set_hooks(#{on_request => OnRequest, on_error => OnError}),
+        ?assertMatch({ok, #{status := 503, body := {full, <<"/changed">>}}},
+                     hornbeam_test_http:request(get, Url, #{}))
+    after
+        hornbeam_http_hooks:set_hooks(Hooks)
+    end.
