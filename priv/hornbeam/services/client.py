@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from hornbeam._shared.validation import byte_payload, text
 from hornbeam.api.errors import RuntimeProtocolError, RuntimeUnavailable
 from hornbeam.services._wire import integer, result, scope_owner
+from hornbeam.services.presence import PresenceSubscription
 from hornbeam.services.store import ByteStore
 from hornbeam.services.subscription import Subscription
 
@@ -72,4 +73,30 @@ class Beam:
 
         return integer(
             result(await async_call("hornbeam_services", "subscription_count", [])), minimum=0
+        )
+
+    def presence(
+        self,
+        topic: str,
+        key: str,
+        payload: bytes,
+        *,
+        max_bytes: int = 65536,
+    ) -> PresenceSubscription:
+        """Track with this owner; receive initial and refreshed full snapshots."""
+        encoded = text(topic, name="topic", limit=256, nonempty=True)
+        encoded_key = text(key, name="key", limit=1024, nonempty=True)
+        data = byte_payload(payload, limit=65536)
+        if type(max_bytes) is not int:
+            raise TypeError("max_bytes must be an integer")
+        if not 1024 <= max_bytes <= 1048576:
+            raise ValueError("max_bytes must be between 1024 and 1048576")
+        return PresenceSubscription(
+            self._owner,
+            secrets.token_bytes(16),
+            self._cleanup_timeout,
+            encoded,
+            max_bytes,
+            encoded_key,
+            data,
         )

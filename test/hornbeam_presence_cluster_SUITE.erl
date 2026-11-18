@@ -8,14 +8,15 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([test_multiple_tabs/1, test_late_join/1, test_network_split/1,
-         test_node_loss/1]).
--export([start_services/0, tab/3, watch/1]).
+         test_node_loss/1, test_managed_subscription/1]).
+-export([start_services/0, tab/3, watch/1, start_bridge/0, managed_tab/2]).
 
 -define(TOPIC, <<"room:lobby">>).
 -define(TIMEOUT, 5000).
 
 all() ->
-    [test_multiple_tabs, test_late_join, test_network_split, test_node_loss].
+    [test_multiple_tabs, test_late_join, test_network_split, test_node_loss,
+     test_managed_subscription].
 
 init_per_suite(Config) ->
     _ = os:cmd("epmd -daemon"),
@@ -137,6 +138,27 @@ test_node_loss(_Config) ->
 %%% Cluster helpers (run on the Common Test node)
 %%% ============================================================================
 
+test_managed_subscription(_Config) ->
+    [A = {PeerA, _}, B = {PeerB, _}] = Nodes = start_cluster(2),
+    try
+        ok = peer:call(PeerA, ?MODULE, start_bridge, []),
+        ok = peer:call(PeerB, ?MODULE, start_bridge, []),
+        TabA = peer:call(PeerA, ?MODULE, managed_tab, [<<"a">>, <<0, 255>>]),
+        TabB = peer:call(PeerB, ?MODULE, managed_tab, [<<"b">>, <<"node B">>]),
+        Both = [{<<"a">>, <<0, 255>>}, {<<"b">>, <<"node B">>}],
+        managed_snapshot(A, TabA, Both), managed_snapshot(B, TabB, Both),
+        close_tab(B, TabB),
+        managed_snapshot(A, TabA, [{<<"a">>, <<0, 255>>}]),
+        _ = peer:call(PeerB, ?MODULE, managed_tab, [<<"b">>, <<"again">>]),
+        managed_snapshot(A, TabA, [{<<"a">>, <<0, 255>>}, {<<"b">>, <<"again">>}]),
+        stop_node(B),
+        managed_snapshot(A, TabA, [{<<"a">>, <<0, 255>>}])
+    after stop_cluster(Nodes) end.
+
+managed_snapshot({Peer, _}, Tab, Expected) ->
+    ?assertEqual(Expected,
+        peer:call(Peer, gen_server, call, [Tab, {snapshot, Expected}, ?TIMEOUT * 2])).
+
 start_cluster(Count) ->
     Nodes = [start_node() || _ <- lists:seq(1, Count)],
     lists:foreach(fun start_presence/1, Nodes),
@@ -221,6 +243,43 @@ start_services() ->
     {ok, _} = gen_server:start({local, hornbeam_pubsub}, hornbeam_pubsub, [], []),
     {ok, _} = gen_server:start({local, hornbeam_presence}, hornbeam_presence, [], []),
     ok.
+
+start_bridge() ->
+    {ok, _} = gen_server:start({local, hornbeam_state}, hornbeam_state, [], []),
+    {ok, _} = gen_server:start({local, hornbeam_services}, hornbeam_services, [], []),
+    ok.
+
+managed_tab(Key, Payload) ->
+    Caller = self(),
+    Pid = spawn(fun() ->
+        {<<"ok">>, Channel} = hornbeam_services:call(<<"presence">>,
+            [self(), <<1:128>>, ?TOPIC, Key, Payload, 65536]),
+        Caller ! {tracked, self()},
+        managed_loop(Channel)
+    end),
+    receive {tracked, Pid} -> Pid after ?TIMEOUT -> error(track_timeout) end.
+
+managed_loop(Channel) ->
+    receive
+        {'$gen_call', From, {snapshot, Expected}} ->
+            gen_server:reply(From, managed_receive(Channel, Expected,
+                erlang:monotonic_time(millisecond) + ?TIMEOUT)),
+            managed_loop(Channel)
+    end.
+
+managed_receive(Channel, Expected, Deadline) ->
+    case py_nif:channel_try_receive(Channel) of
+        {ok, {<<"presence">>, Entries}} ->
+            case [{Key, Payload} || {Key, _, {bytes, Payload}} <- Entries] of
+                Expected -> Expected;
+                _ -> managed_receive(Channel, Expected, Deadline)
+            end;
+        {error, empty} ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true -> receive after 1 -> managed_receive(Channel, Expected, Deadline) end;
+                false -> error({snapshot_timeout, Expected})
+            end
+    end.
 
 tab(Topic, Key, Tab) ->
     Caller = self(),
