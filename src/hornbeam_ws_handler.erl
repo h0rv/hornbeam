@@ -22,6 +22,7 @@
 -export([init/2, handle_in/2, handle_info/2, terminate/2, output/1]).
 
 -define(OUTPUT_TIMEOUT, 5000).
+-define(ASGI_FULLSWEEP_AFTER, 0).
 
 -record(state, {
     session_id :: binary(),
@@ -139,6 +140,7 @@ terminate(_Reason, _State) ->
 %%% Internal functions
 
 start_asgi(Scope, Opts, State) ->
+    process_flag(fullsweep_after, ?ASGI_FULLSWEEP_AFTER),
     %% Two maximum-sized frames plus term encoding overhead. Python's local
     %% queue is also bounded; sustained backpressure closes with 1013, not blocking
     %% the socket process or silently dropping application messages.
@@ -149,7 +151,8 @@ start_asgi(Scope, Opts, State) ->
             TaskRef = make_ref(),
             RelayState = State#state{input = Input, task_ref = TaskRef,
                                      max_output_frame = MaxFrame},
-            Guard = spawn(fun() -> relay_output(Owner, RelayState) end),
+            Guard = spawn_opt(fun() -> relay_output(Owner, RelayState) end,
+                              [{fullsweep_after, ?ASGI_FULLSWEEP_AFTER}]),
             hornbeam_websocket:register_task(Guard),
             State1 = State#state{input = Input, input_guard = Guard,
                                  task_ref = TaskRef},

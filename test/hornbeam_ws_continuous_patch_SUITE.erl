@@ -131,6 +131,12 @@ idle_output_and_owner(Config) ->
     try
         %% No inbound application frame is sent before all three outputs.
         initial_frames(Client),
+        [Owner] = hornbeam_pubsub:get_members(<<"ws-patch">>),
+        [{Relay}] = ets:tab2list(hornbeam_ws_tasks),
+        lists:foreach(fun(Pid) ->
+            {garbage_collection, GC} = process_info(Pid, garbage_collection),
+            ?assertEqual(0, proplists:get_value(fullsweep_after, GC))
+        end, [Owner, Relay]),
         Bytes = <<"caf", 195, 169, 233, 155, 170>>,
         ok = ws:send(Client, {binary, Bytes}),
         ?assertEqual({binary, Bytes}, next_frame(Client))
