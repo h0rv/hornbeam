@@ -4,6 +4,7 @@
 presence_test_() ->
     {foreach, fun setup/0, fun cleanup/1, [
         fun snapshots_and_acknowledged_close/0,
+        fun bytes_and_presence_share_topic/0,
         fun initial_snapshot_overflow/0,
         fun bounded_pending_diffs/0,
         fun slow_reader_overflow/0,
@@ -85,6 +86,22 @@ snapshot_rows(Channel, Count) ->
             _ -> retry
         end
     end, erlang:monotonic_time(millisecond) + 3000).
+
+bytes_and_presence_share_topic() ->
+    Bytes = value(<<"subscribe">>, [self(), <<1:128>>, <<"online">>, 1024]),
+    Presence = open(self(), 2, <<"tab">>, <<"node A">>, 1024),
+    _ = snapshot(Presence, [{<<"tab">>, <<"node A">>}]),
+    ?assertEqual(<<"open">>, status(self(), 1)),
+    ?assertEqual({error, empty}, py_nif:channel_try_receive(Bytes)),
+    2 = value(<<"publish">>, [<<"online">>, <<"post">>]),
+    ?assertEqual({ok, {<<"event">>, {bytes, <<"post">>}}},
+                 py_nif:channel_try_receive(Bytes)),
+    ?assertEqual({error, empty}, py_nif:channel_try_receive(Presence)),
+    true = close(self(), 2),
+    ?assertEqual(<<"open">>, status(self(), 1)),
+    1 = value(<<"publish">>, [<<"online">>, <<"after leave">>]),
+    ?assertEqual({ok, {<<"event">>, {bytes, <<"after leave">>}}},
+                 py_nif:channel_try_receive(Bytes)).
 
 initial_snapshot_overflow() ->
     Ch = open(self(), 1, <<"large">>, binary:copy(<<$x>>, 2048), 1024),

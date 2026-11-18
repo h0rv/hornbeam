@@ -59,6 +59,7 @@ managed_delivery(Pid, Topic, Message) ->
         [{Pid, Topic, Channel, Flag}] ->
             case {atomics:get(Flag, 1), atomics:get(Flag, 3), Message} of
                 {?OPEN, 1, {presence_diff, _}} -> presence_changed(Pid, Flag);
+                {?OPEN, 0, {presence_diff, _}} -> ok;
                 {?OPEN, 0, _} -> deliver(Pid, Channel, Flag, Message);
                 _ -> ok
             end,
