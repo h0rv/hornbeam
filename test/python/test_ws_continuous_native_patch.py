@@ -12,6 +12,9 @@ import unittest
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import override
+from unittest.mock import patch
+
+import hornbeam_lifespan_runner as lifespan
 
 Message = dict[str, object]
 Receive = Callable[[], Awaitable[Message]]
@@ -70,10 +73,45 @@ finally:
 
 
 class ContinuousWebSocketPatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scope_state_is_a_shallow_mount_copy(self) -> None:
+        resource = object()
+        for mount in (None, "first", "second", "missing"):
+            state = {"resource": resource} if mount != "missing" else {}
+
+            async def app(
+                scope: Message, receive: Receive, send: Send, *, expected: Message = state
+            ) -> None:
+                copied = scope["state"]
+                assert isinstance(copied, dict)
+                self.assertEqual(copied, expected)
+                self.assertIsNot(copied, expected)
+                if expected:
+                    self.assertIs(copied["resource"], resource)
+                copied["local"] = True
+
+            module = types.ModuleType("ws_state_app")
+            module.__dict__["app"] = app
+            with patch.dict(sys.modules, {"ws_state_app": module}), patch.object(
+                lifespan, "_lifespan_state", state if mount is None else {}
+            ), patch.object(
+                lifespan, "_lifespan_states", {mount: state} if mount not in (None, "missing") else {}
+            ):
+                await runner.handle_websocket(
+                    "owner", "ws_state_app", "app", {"mount_id": mount}, "state", FakeChannel()
+                )
+            self.assertNotIn("local", state)
+
     @override
     async def asyncSetUp(self) -> None:
         self.output: asyncio.Queue[tuple[object, object]] = asyncio.Queue()
         _bridge.__dict__["send"] = lambda owner, message: self.output.put_nowait((owner, message))
+
+        async def output(name: str, owner: object, relay: object, message: object) -> int:
+            self.assertEqual(name, "hornbeam_ws_output")
+            self.output.put_nowait((relay, message))
+            return 1
+
+        _bridge.__dict__["async_call"] = output
         self.tasks: list[asyncio.Task[bytes]] = []
         self.modules: list[str] = []
 

@@ -62,6 +62,7 @@
     update_state/2,
     update_state/3,
     get_context/0,
+    get_loop/1,
     is_running/0,
     is_running/1
 ]).
@@ -213,6 +214,17 @@ get_context() ->
         [] -> undefined
     end.
 
+-spec get_loop(binary() | undefined) -> {ok, reference()} | {error, term()}.
+get_loop(MountId) ->
+    Cached = case ets:whereis(?CACHE_TABLE) of
+        undefined -> [];
+        Table -> ets:lookup(Table, {lifespan_loop, MountId})
+    end,
+    case Cached of
+        [{{lifespan_loop, MountId}, LoopRef}] -> {ok, LoopRef};
+        [] -> py_event_loop_pool:get_loop()
+    end.
+
 %%% ============================================================================
 %%% gen_server callbacks
 %%% ============================================================================
@@ -314,6 +326,7 @@ handle_call({shutdown_mount, MountId}, _From, #state{mounts = Mounts} = State) -
         #mount_lifespan{started = false} -> {reply, ok, State};
         #mount_lifespan{session = Session} = ML ->
             Result = run_shutdown(Session),
+            ets:delete(?CACHE_TABLE, {lifespan_loop, MountId}),
             ets:insert(?CACHE_TABLE, [
                 {{started, MountId}, false},
                 {{lifespan_state, MountId}, #{}}
@@ -322,10 +335,21 @@ handle_call({shutdown_mount, MountId}, _From, #state{mounts = Mounts} = State) -
                 ML#mount_lifespan{started = false, session = undefined}}}}
     end;
 
+handle_call(shutdown, From, #state{mounts = Mounts} = State) when map_size(Mounts) > 0 ->
+    {Results, NewState} = lists:mapfoldl(fun(MountId, AccState) ->
+        {reply, Result, NextState} = handle_call({shutdown_mount, MountId}, From, AccState),
+        {Result, NextState}
+    end, State, maps:keys(Mounts)),
+    {reply, Result, FinalState} = handle_call(shutdown, From, NewState#state{mounts = #{}}),
+    Errors = [Error || Error <- Results ++ [Result], Error =/= ok],
+    Reply = case Errors of [] -> ok; [First | _] -> First end,
+    {reply, Reply, FinalState};
+
 handle_call(shutdown, _From, #state{started = false} = State) ->
     {reply, ok, State};
 handle_call(shutdown, _From, #state{session = Session} = State) ->
     Result = run_shutdown(Session),
+    ets:delete(?CACHE_TABLE, {lifespan_loop, undefined}),
     ets:insert(?CACHE_TABLE, [{started, false}, {lifespan_state, #{}}]),
     {reply, Result, State#state{started = false, lifespan_state = #{}, session = undefined}};
 handle_call(get_state, _From, #state{lifespan_state = LifespanState} = State) ->
@@ -407,6 +431,7 @@ handle_info({<<"update_state">>, MountId, Key, Value}, State) ->
 
 handle_info({async_result, Ref, Result}, #state{session = {Ref, _, Channel}} = State) ->
     py_channel:close(Channel),
+    ets:delete(?CACHE_TABLE, {lifespan_loop, undefined}),
     ets:insert(?CACHE_TABLE, {started, false}),
     error_logger:error_msg("Lifespan task exited: ~p~n", [Result]),
     {noreply, State#state{started = false, session = undefined}};
@@ -415,6 +440,7 @@ handle_info({async_result, Ref, Result}, #state{mounts = Mounts} = State) ->
         case ML#mount_lifespan.session of
             {Ref, _, Channel} ->
                 py_channel:close(Channel),
+                ets:delete(?CACHE_TABLE, {lifespan_loop, MountId}),
                 ets:insert(?CACHE_TABLE, {{started, MountId}, false}),
                 error_logger:error_msg("Mount lifespan task exited (~p): ~p~n", [MountId, Result]),
                 ML#mount_lifespan{started = false, session = undefined};
@@ -441,9 +467,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal Functions
 %%% ============================================================================
 
-%% The pool loop keeps running after startup returns. PID affinity alone does
-%% not put requests on this same loop: loop-bound application resources require
-%% erlang_python.event_loop_pool_size = 1 in the MVP.
+%% Keep handlers on the lifespan loop so application resources retain affinity.
 run_startup(AppModule, AppCallable, MountId) ->
     try
         {ok, Channel} = py_channel:new(#{max_size => 1024}),
@@ -459,7 +483,9 @@ run_startup(AppModule, AppCallable, MountId) ->
             case await_response(Session, lifespan_timeout() + 500) of
                 {ok, Response} ->
                     case handle_startup_response(Response) of
-                        {ok, AppState} -> {ok, AppState, Session};
+                        {ok, AppState} ->
+                            ets:insert(?CACHE_TABLE, {{lifespan_loop, MountId}, LoopRef}),
+                            {ok, AppState, Session};
                         Error -> py_channel:close(Channel), Error
                     end;
                 Error -> py_channel:close(Channel), Error

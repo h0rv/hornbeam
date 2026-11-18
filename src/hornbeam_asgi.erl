@@ -77,8 +77,7 @@ handle(Req, HandlerState) ->
             {{channel, Ch}, livery_body:ref(Reader)}
     end,
 
-    %% Submit task to event loop pool for parallel distribution
-    {ok, LoopRef} = py_event_loop_pool:get_loop(),
+    {ok, LoopRef} = hornbeam_lifespan:get_loop(maps:get(mount_id, HandlerState, undefined)),
     TaskRef = make_ref(),
     ok = py_nif:submit_task(LoopRef, self(), TaskRef,
         <<"hornbeam_asgi_worker">>, <<"handle_asgi">>,
