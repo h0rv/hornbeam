@@ -235,6 +235,7 @@ stop() ->
     %% the state those requests used. The list is the order.
     _ = [safe(Step) || Step <- [
         fun hornbeam_listener:stop_service/0,
+        fun hornbeam_websocket:drain/0,
         fun hornbeam_lifespan:shutdown/0,
         fun hornbeam_http_hooks:clear/0,
         fun hornbeam_hooks:clear/0,

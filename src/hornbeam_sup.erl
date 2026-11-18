@@ -41,6 +41,7 @@ start_link() ->
 init([]) ->
     hornbeam_ws_sessions = ets:new(hornbeam_ws_sessions,
         [named_table, public, set, {read_concurrency, true}]),
+    hornbeam_ws_tasks = ets:new(hornbeam_ws_tasks, [named_table, public, set]),
     SupFlags = #{
         strategy => one_for_one,
         intensity => 10,

@@ -21,6 +21,7 @@
 -module(hornbeam_websocket).
 
 -export([upgrade/2, build_websocket_scope/2]).
+-export([register_task/1, unregister_task/1, drain/0]).
 
 %% Pubsub API for Python
 -export([
@@ -30,6 +31,31 @@
     register_session/2,
     unregister_session/1
 ]).
+
+register_task(Pid) ->
+    ets:insert(hornbeam_ws_tasks, {Pid}),
+    ok.
+
+unregister_task(Pid) ->
+    ets:delete(hornbeam_ws_tasks, Pid),
+    ok.
+
+drain() ->
+    Monitors = [begin
+        Ref = erlang:monitor(process, Pid),
+        Pid ! shutdown,
+        Ref
+    end || {Pid} <- ets:tab2list(hornbeam_ws_tasks)],
+    Deadline = erlang:monotonic_time(millisecond) + 6000,
+    lists:foreach(fun(Ref) ->
+        Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+        receive {'DOWN', Ref, process, _, _} -> ok
+        after Remaining ->
+            erlang:demonitor(Ref, [flush]),
+            logger:warning("WebSocket cleanup did not finish before shutdown")
+        end
+    end, Monitors),
+    ok.
 
 %% @doc Upgrade an HTTP request to a WebSocket session.
 %%
