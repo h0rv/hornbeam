@@ -27,6 +27,10 @@
 
 -export([handle/2, output/1, await_exit/1]).
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
+
 %% Threshold for passing the request body inline (64KB)
 %% Bodies smaller than this are read synchronously and passed as a binary
 -define(ASGI_BODY_BUFFER_THRESHOLD, 65536).
@@ -295,6 +299,7 @@ wait_body_capacity(St, Data, Deadline) ->
     Remaining = Deadline - erlang:monotonic_time(millisecond),
     receive
         {livery_disconnect, _, _} = Msg -> body_interrupted(Msg);
+        {<<"full_response">>, _, _, _} = Msg -> body_interrupted(Msg);
         <<"fin">> = Msg -> body_interrupted(Msg);
         {<<"error">>, _} = Msg -> body_interrupted(Msg);
         {async_result, _, {error, _}} = Msg -> body_interrupted(Msg)
@@ -308,6 +313,19 @@ wait_body_capacity(St, Data, Deadline) ->
 body_interrupted(Msg) ->
     self() ! Msg,
     {error, interrupted}.
+
+-ifdef(TEST).
+full_response_interrupts_body_capacity_wait_test() ->
+    Response = {<<"full_response">>, 413, [], <<>>},
+    self() ! Response,
+    ?assertEqual({error, interrupted},
+                 wait_body_capacity(#{}, <<>>, erlang:monotonic_time(millisecond))),
+    receive
+        Response -> ok
+    after 0 ->
+        ?assert(false)
+    end.
+-endif.
 
 maybe_close_channel(undefined) -> ok;
 maybe_close_channel(Channel) ->
