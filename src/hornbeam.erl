@@ -990,6 +990,8 @@ ensure_binary(V) when is_atom(V) -> atom_to_binary(V, utf8).
 %% Register hornbeam functions so Python can call them via erlang.call()
 register_python_callbacks() ->
     py:register_function(hornbeam_ws_output, fun hornbeam_ws_handler:output/1),
+    py:register_function(hornbeam_http_output, fun hornbeam_asgi:output/1),
+    py:register_function(hornbeam_http_disconnect, fun hornbeam_asgi:await_exit/1),
     %% Generic async-call service boundary; no application framework dependency.
     py:register_function(hornbeam_services, fun hornbeam_services:callback/1),
     %% Hook registration (called from Python to register/unregister hooks)

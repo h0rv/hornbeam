@@ -25,7 +25,7 @@
 %%% @end
 -module(hornbeam_asgi).
 
--export([handle/2]).
+-export([handle/2, output/1, await_exit/1]).
 
 %% Threshold for passing the request body inline (64KB)
 %% Bodies smaller than this are read synchronously and passed as a binary
@@ -111,12 +111,11 @@ wait_response(#{req_info := ReqInfo, timeout_ms := TimeoutMs} = St) ->
             %% surfaces to Python as EOF on its body reads
             maybe_close_channel(maps:get(channel, St)),
             wait_response(St#{body_ref := undefined});
+        {hornbeam_http_output, From, Ref,
+         {<<"start_response">>, StatusCode, Headers, FirstChunk}} ->
+            start_stream(StatusCode, Headers, FirstChunk, {From, Ref}, St);
         {<<"start_response">>, StatusCode, Headers, FirstChunk} ->
-            SafeHeaders = hornbeam_handler:convert_headers(
-                hornbeam_handler:filter_hop_by_hop(Headers)),
-            Status = hornbeam_handler:parse_status_code(StatusCode),
-            {stream, Status, SafeHeaders,
-             fun(Emit) -> stream_response(Emit, FirstChunk, St) end};
+            start_stream(StatusCode, Headers, FirstChunk, none, St);
         {<<"early_hints">>, Headers} ->
             %% Best-effort: h3 (and HTTP/1.0 clients) have no interim
             %% responses, and livery answers {error, unsupported}
@@ -149,18 +148,36 @@ wait_response(#{req_info := ReqInfo, timeout_ms := TimeoutMs} = St) ->
 %%% Producer: stream chunks to the client
 %%% ============================================================================
 
-stream_response(Emit, FirstChunk, St) ->
-    case hornbeam_handler:to_binary(FirstChunk) of
-        <<>> ->
+start_stream(StatusCode, Headers, FirstChunk, Ack, St) ->
+    SafeHeaders = hornbeam_handler:convert_headers(
+        hornbeam_handler:filter_hop_by_hop(Headers)),
+    Status = hornbeam_handler:parse_status_code(StatusCode),
+    {stream, Status, SafeHeaders,
+     fun(Emit) -> emit_chunk(Emit, FirstChunk, Ack, St) end}.
+
+%% Ack is the Python sender waiting in output/1, or none for a chunk sent
+%% without flow control. Replying only after Emit returns is what holds a
+%% streaming app to the client's read rate.
+emit_chunk(Emit, Data, Ack, St) ->
+    Result = case hornbeam_handler:to_binary(Data) of
+        <<>> -> ok;
+        Body -> Emit(Body)
+    end,
+    case Result of
+        ok ->
+            ack(Ack, ok),
             stream_loop(Emit, St);
-        Body ->
-            case Emit(Body) of
-                ok -> stream_loop(Emit, St);
-                {error, _} -> stream_done(St)
-            end
+        {error, _} ->
+            ack(Ack, closed),
+            stream_done(St)
     end.
 
-stream_loop(Emit, #{timeout_ms := TimeoutMs} = St) ->
+ack(none, _Result) -> ok;
+ack({From, Ref}, Result) -> From ! {Ref, Result}, ok.
+
+%% Streams have no idle timeout: SSE stays quiet between events, and the
+%% stream ends when the app finishes or the client disconnects.
+stream_loop(Emit, St) ->
     BodyRef = pump_ref(St),
     receive
         {livery_body, BodyRef, {data, Data}} ->
@@ -172,11 +189,10 @@ stream_loop(Emit, #{timeout_ms := TimeoutMs} = St) ->
         {livery_body, BodyRef, _EofOrError} ->
             maybe_close_channel(maps:get(channel, St)),
             stream_loop(Emit, St#{body_ref := undefined});
+        {hornbeam_http_output, From, Ref, {<<"chunk">>, Data}} ->
+            emit_chunk(Emit, Data, {From, Ref}, St);
         {<<"chunk">>, Data} ->
-            case Emit(hornbeam_handler:to_binary(Data)) of
-                ok -> stream_loop(Emit, St);
-                {error, _} -> stream_done(St)
-            end;
+            emit_chunk(Emit, Data, none, St);
         <<"fin">> ->
             cleanup(St),
             ok;
@@ -194,9 +210,6 @@ stream_loop(Emit, #{timeout_ms := TimeoutMs} = St) ->
             stream_loop(Emit, St);
         {livery_disconnect, _Ref, _Reason} ->
             stream_done(St)
-    after TimeoutMs ->
-        cleanup(St),
-        ok
     end.
 
 %% @private
@@ -209,6 +222,35 @@ stream_loop(Emit, #{timeout_ms := TimeoutMs} = St) ->
 stream_done(St) ->
     cleanup(St),
     {error, closed}.
+
+%%% ============================================================================
+%%% Python callbacks (registered in hornbeam:register_python_callbacks/0)
+%%% ============================================================================
+
+%% @doc Deliver one streaming response message and wait until it is written.
+%% Returns 1 once written, 0 when the client is gone.
+-spec output([pid() | tuple()]) -> 0 | 1.
+output([Pid, Message]) when is_pid(Pid) ->
+    Ref = erlang:monitor(process, Pid),
+    Pid ! {hornbeam_http_output, self(), Ref, Message},
+    receive
+        {Ref, Result} ->
+            erlang:demonitor(Ref, [flush]),
+            case Result of
+                ok -> 1;
+                closed -> 0
+            end;
+        {'DOWN', Ref, process, Pid, _} -> 0
+    end.
+
+%% @doc Return once the request process has exited: the client
+%% disconnected or the response is over.
+-spec await_exit([pid()]) -> 1.
+await_exit([Pid]) when is_pid(Pid) ->
+    Ref = erlang:monitor(process, Pid),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> 1
+    end.
 
 %%% ============================================================================
 %%% Internal Functions

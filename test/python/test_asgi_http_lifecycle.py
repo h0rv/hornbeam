@@ -107,3 +107,76 @@ def test_channel_eof__should_suspend_until_disconnect(
         assert pending.result() == {"type": "http.disconnect"}
 
     asyncio.run(exercise())
+
+
+class FakeErlang:
+    """Records flow-controlled output; replies 1 (written) or 0 (client gone)."""
+
+    def __init__(self, written: bool) -> None:
+        self.written = written
+        self.calls: list[tuple[object, ...]] = []
+
+    async def async_call(self, name: str, *args: object) -> int:
+        self.calls.append((name, *args))
+        return 1 if self.written else 0
+
+
+def protocol(fake: FakeErlang, sent: list[object]) -> worker.ASGIProtocol:
+    proto = worker.ASGIProtocol("owner", None, {}, worker.BodyReceiver("empty"))
+    proto._send_fn = lambda _pid, message: sent.append(message)
+    return proto
+
+
+def test_streaming_send__should_wait_for_each_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeErlang(written=True)
+    monkeypatch.setattr(worker, "erlang", fake)
+    sent: list[object] = []
+    proto = protocol(fake, sent)
+
+    async def exercise() -> None:
+        await proto.send({"type": "http.response.start", "status": 200, "headers": []})
+        await proto.send({"type": "http.response.body", "body": b"a", "more_body": True})
+        await proto.send({"type": "http.response.body", "body": b"b", "more_body": True})
+        await proto.send({"type": "http.response.body", "body": b""})
+
+    asyncio.run(exercise())
+    assert fake.calls == [
+        ("hornbeam_http_output", "owner", (b"start_response", 200, [], b"a")),
+        ("hornbeam_http_output", "owner", (b"chunk", b"b")),
+    ]
+    assert sent == [b"fin"]
+
+
+def test_streaming_send__should_raise_oserror_once_client_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeErlang(written=False)
+    monkeypatch.setattr(worker, "erlang", fake)
+    proto = protocol(fake, [])
+
+    async def exercise() -> None:
+        await proto.send({"type": "http.response.start", "status": 200, "headers": []})
+        with pytest.raises(OSError):
+            await proto.send({"type": "http.response.body", "body": b"a", "more_body": True})
+        with pytest.raises(OSError):
+            await proto.send({"type": "http.response.body", "body": b"b", "more_body": True})
+        assert await proto.receive() == {"type": "http.request", "body": b"", "more_body": False}
+        assert await proto.receive() == {"type": "http.disconnect"}
+
+    asyncio.run(exercise())
+    assert len(fake.calls) == 1
+
+
+def test_single_body_response__should_not_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeErlang(written=True)
+    monkeypatch.setattr(worker, "erlang", fake)
+    sent: list[object] = []
+    proto = protocol(fake, sent)
+
+    async def exercise() -> None:
+        await proto.send({"type": "http.response.start", "status": 200, "headers": []})
+        await proto.send({"type": "http.response.body", "body": b"ok"})
+
+    asyncio.run(exercise())
+    assert fake.calls == []
+    assert sent == [(b"start_response", 200, [], b"ok"), b"fin"]
