@@ -341,7 +341,7 @@ start_multi(Config) ->
                     setup_mounts_pythonpath(NormalizedMounts),
 
                     %% Run lifespan startup for ASGI mounts
-                    case maybe_run_multi_lifespan_startup(NormalizedMounts, GlobalConfig) of
+                    case maybe_run_multi_lifespan_startup(hornbeam_mounts:list(), GlobalConfig) of
                         ok ->
                             %% Start the HTTP listener in multi-app mode
                             start_listener_multi(GlobalConfig);

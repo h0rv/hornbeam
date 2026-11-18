@@ -40,8 +40,8 @@ upgrade(Req, State) ->
     Scope = build_websocket_scope(Req, State),
 
     %% Get app module and callable from config
-    AppModule = hornbeam_config:get_config(app_module),
-    AppCallable = hornbeam_config:get_config(app_callable),
+    AppModule = maps:get(app_module, State),
+    AppCallable = maps:get(app_callable, State),
 
     %% Generate session ID for this connection
     SessionId = generate_session_id(),
@@ -57,6 +57,7 @@ upgrade(Req, State) ->
         scope => Scope,
         app_module => AppModule,
         app_callable => AppCallable,
+        mount_id => maps:get(mount_id, State, undefined),
         session_id => SessionId,
         %% Native channel compatibility is opt-in, never inferred from JSON.
         websocket_protocol => maps:get(websocket_protocol,
@@ -89,7 +90,7 @@ build_websocket_scope(Req, State) ->
         _ -> <<"ws">>
     end,
 
-    #{
+    BaseScope = #{
         <<"type">> => <<"websocket">>,
         <<"asgi">> => #{
             <<"version">> => <<"3.0">>,
@@ -107,7 +108,11 @@ build_websocket_scope(Req, State) ->
         <<"server">> => [Host, Port],
         <<"client">> => [<<>>, 0],
         <<"subprotocols">> => Subprotocols
-    }.
+    },
+    case maps:get(mount_id, State, undefined) of
+        undefined -> BaseScope;
+        MountId -> BaseScope#{mount_id => MountId}
+    end.
 
 get_subprotocols(Req) ->
     case livery_req:header(<<"sec-websocket-protocol">>, Req) of
