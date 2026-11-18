@@ -43,6 +43,10 @@ _EMPTY_BODY_MSG = {'type': 'http.request', 'body': b'', 'more_body': False}
 _DISCONNECT_MSG = {'type': 'http.disconnect'}
 
 
+class ClientDisconnected(OSError):
+    """send() after the client went away (ASGI spec: an OSError subclass)."""
+
+
 class BodyReceiver:
     """Body receiver with Future-based waiting (gunicorn pattern).
 
@@ -55,9 +59,11 @@ class BodyReceiver:
     """
 
     __slots__ = ('_mode', '_data', '_channel', '_complete', '_disconnected',
-                 '_waiter', '_chunks')
+                 '_waiter', '_chunks', '_owner', '_watch')
 
-    def __init__(self, body_ref):
+    def __init__(self, body_ref, owner=None):
+        self._owner = owner
+        self._watch: asyncio.Future | None = None
         self._complete = False
         self._disconnected = False
         self._waiter: asyncio.Future[None] | None = None
@@ -141,12 +147,21 @@ class BodyReceiver:
             raise RuntimeError(message)
         waiter = asyncio.get_running_loop().create_future()
         self._waiter = waiter
+        self._watch_owner()
         try:
             while not self._disconnected:
                 await waiter
             return _DISCONNECT_MSG
         finally:
             self._waiter = None
+
+    def _watch_owner(self):
+        """Signal disconnect once the Erlang request process exits."""
+        if self._owner is None or self._watch is not None:
+            return
+        self._watch = asyncio.ensure_future(
+            erlang.async_call('hornbeam_http_disconnect', self._owner))
+        self._watch.add_done_callback(lambda _: self.signal_disconnect())
 
     def _pop_chunk(self) -> dict:
         """Pop buffered chunk and return message."""
@@ -232,14 +247,22 @@ class ASGIProtocol:
 
             more_body = message.get('more_body', False)
 
+            if self._body_receiver._disconnected:
+                raise ClientDisconnected("client disconnected")
+
             if self._headers is not None:
                 # First body - send start_response with headers + first chunk
-                self._send_fn(self._caller_pid,
-                             (b'start_response', self._status, self._headers, body))
+                start = (b'start_response', self._status, self._headers, body)
                 self._headers = None
-            else:
+                if more_body:
+                    await self._output(start)
+                else:
+                    self._send_fn(self._caller_pid, start)
+            elif body:
                 # Subsequent chunk
-                if body:
+                if more_body:
+                    await self._output((b'chunk', body))
+                else:
                     self._send_fn(self._caller_pid, (b'chunk', body))
 
             if not more_body:
@@ -255,6 +278,16 @@ class ASGIProtocol:
 
         elif msg_type == 'http.disconnect':
             self._response_finished = True
+
+    async def _output(self, message: tuple) -> None:
+        """Send a streaming message and wait until Erlang has written it.
+
+        Waiting bounds buffering to one chunk per stream: a slow client
+        slows the app instead of growing a queue.
+        """
+        if await erlang.async_call('hornbeam_http_output', self._caller_pid, message) != 1:
+            self._body_receiver.signal_disconnect()
+            raise ClientDisconnected("client disconnected")
 
     async def run(self):
         """Run the ASGI application."""
@@ -318,7 +351,7 @@ async def handle_asgi(caller_pid, app_module: str, app_callable: str,
     scope['state'] = get_state(scope.get('mount_id')).copy()
 
     # Create body receiver (handles body mode detection)
-    body_receiver = BodyReceiver(req_body_ref)
+    body_receiver = BodyReceiver(req_body_ref, caller_pid)
 
     # Create and run protocol
     protocol = ASGIProtocol(caller_pid, app, scope, body_receiver)
