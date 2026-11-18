@@ -7,12 +7,12 @@
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 -export([idle_output_and_owner/1, five_item_arrays_are_asgi/1,
-         native_channels_are_explicit/1]).
+         native_channels_are_explicit/1, mounted_legacy_topics_are_isolated/1]).
 %% Also act as the ws client's observer handler.
 -export([init/2, handle_in/2, handle_info/2, terminate/2]).
 
 all() -> [idle_output_and_owner, five_item_arrays_are_asgi,
-          native_channels_are_explicit].
+          native_channels_are_explicit, mounted_legacy_topics_are_isolated].
 
 init_per_suite(Config) ->
     application:load(hornbeam),
@@ -36,7 +36,14 @@ init_per_testcase(Test, Config) ->
         native_channels_are_explicit -> Options#{websocket_protocol => channels};
         _ -> Options
     end,
-    ok = hornbeam:start("ws_continuous_patch_app:app", Selected),
+    case Test of
+        mounted_legacy_topics_are_isolated ->
+            ok = hornbeam:start(Selected#{mounts => [
+                {<<"/">>, "ws_continuous_patch_app:app", #{worker_class => asgi}},
+                {<<"/public">>, "ws_continuous_patch_app:app", #{worker_class => asgi}},
+                {<<"/other">>, "ws_continuous_patch_app:app", #{worker_class => asgi}}]});
+        _ -> ok = hornbeam:start("ws_continuous_patch_app:app", Selected)
+    end,
     [{port, Port} | Config].
 
 end_per_testcase(_Test, _Config) ->
@@ -53,8 +60,11 @@ test_apps_dir() ->
     end.
 
 connect(Config) ->
+    connect(Config, "/ws-patch").
+
+connect(Config, Path) ->
     Port = proplists:get_value(port, Config),
-    URL = iolist_to_binary(io_lib:format("ws://127.0.0.1:~p/ws-patch", [Port])),
+    URL = iolist_to_binary(io_lib:format("ws://127.0.0.1:~p~s", [Port, Path])),
     {ok, Client} = ws:connect(URL, #{handler => ?MODULE, handler_opts => self(),
                                    timeout => 5000}),
     Client.
@@ -66,9 +76,34 @@ next_frame(Client) ->
     end.
 
 initial_frames(Client) ->
-    ?assertEqual({text, <<"welcome">>}, next_frame(Client)),
-    ?assertEqual({text, <<"owner-direct">>}, next_frame(Client)),
-    ?assertEqual({text, <<"idle-push">>}, next_frame(Client)).
+    Frames = [next_frame(Client) || _ <- lists:seq(1, 3)],
+    ?assertEqual(lists:sort([{text, <<"welcome">>}, {text, <<"owner-direct">>},
+                             {text, <<"idle-push">>}]), lists:sort(Frames)).
+
+mounted_legacy_topics_are_isolated(Config) ->
+    Root = connect(Config, "/chat/private"),
+    try
+        Public = connect(Config, "/public/chat/private"),
+        try
+            Other = connect(Config, "/other/chat/private"),
+            try
+                lists:foreach(fun initial_frames/1, [Root, Public, Other]),
+                [RootPid] = hornbeam_pubsub:get_members(<<"chat:private">>),
+                [PublicPid] = hornbeam_pubsub:get_members(<<"public:chat:private">>),
+                [OtherPid] = hornbeam_pubsub:get_members(<<"other:chat:private">>),
+                ?assertEqual(3, length(lists:usort([RootPid, PublicPid, OtherPid]))),
+                lists:foreach(fun({Client, Topic, Message}) ->
+                    ?assertEqual(1, hornbeam_pubsub:publish(Topic, Message)),
+                    ?assertEqual({text, Message}, next_frame(Client))
+                end, [{Root, <<"chat:private">>, <<"private-root">>},
+                      {Public, <<"public:chat:private">>, <<"public-only">>},
+                      {Other, <<"other:chat:private">>, <<"other-only">>}])
+            after ws:close(Other, 1000)
+            end
+        after ws:close(Public, 1000)
+        end
+    after ws:close(Root, 1000)
+    end.
 
 idle_output_and_owner(Config) ->
     Client = connect(Config),

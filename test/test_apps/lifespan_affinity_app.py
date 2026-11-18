@@ -15,6 +15,20 @@ class State(TypedDict):
 class Scope(TypedDict):
     type: str
     state: State
+    path: str
+    raw_path: bytes
+    root_path: str
+
+
+async def routed_app(scope: Scope, receive: Receive, send: Send) -> None:
+    if scope['type'] == 'websocket':
+        if scope['path'] != '/ws':
+            await receive()
+            await send({'type': 'websocket.close', 'code': 1008})
+            return
+        assert scope['root_path'] == '/api'
+        assert scope['raw_path'] == b'/api/ws'
+    await app(scope, receive, send)
 
 
 async def app(scope: Scope, receive: Receive, send: Send) -> None:

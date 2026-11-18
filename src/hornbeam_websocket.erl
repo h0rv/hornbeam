@@ -75,6 +75,7 @@ upgrade(Req, State) ->
 -spec build_websocket_scope(livery_req:req(), map()) -> map().
 build_websocket_scope(Req, State) ->
     Path = livery_req:path(Req),
+    {ScopePath, RootPath} = hornbeam_request:asgi_paths(Path, State),
     Headers = livery_req:headers(Req),
     {Host, Port} = hornbeam_request:server_info(Req, State),
 
@@ -99,10 +100,10 @@ build_websocket_scope(Req, State) ->
         <<"http_version">> =>
             hornbeam_request:format_http_version(livery_req:protocol(Req)),
         <<"scheme">> => WsScheme,
-        <<"path">> => Path,
+        <<"path">> => ScopePath,
         <<"raw_path">> => {bytes, Path},
         <<"query_string">> => {bytes, livery_req:query(Req)},
-        <<"root_path">> => <<>>,
+        <<"root_path">> => RootPath,
         <<"headers">> => HeaderList,
         <<"server">> => [Host, Port],
         <<"client">> => [<<>>, 0],

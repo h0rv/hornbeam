@@ -25,7 +25,7 @@
 %%% - Single tuple passed to Python for minimal marshalling overhead
 -module(hornbeam_request).
 
--export([build_wsgi_tuple/2, build_asgi_scope/2]).
+-export([build_wsgi_tuple/2, build_asgi_scope/2, asgi_paths/2]).
 -export([to_wsgi_header_key/1, format_ip/1, format_http_version/1]).
 -export([server_info/2, peer_info/1, scheme/1]).
 
@@ -84,8 +84,7 @@ build_asgi_scope(Req, State) ->
     {Host, Port} = server_info(Req, State),
 
     %% Get root_path and path from state (multi-app) or defaults
-    RootPath = maps:get(script_name, State, <<>>),
-    ScopePath = maps:get(path_info, State, Path),
+    {ScopePath, RootPath} = asgi_paths(Path, State),
 
     %% Force ASGI byte fields through the native converter without its
     %% UTF-8-to-str auto-detection. Preserve duplicate headers and wire order.
@@ -121,6 +120,11 @@ build_asgi_scope(Req, State) ->
         undefined -> BaseScope;
         _ -> BaseScope#{mount_id => MountId}
     end.
+
+%% @doc ASGI path and root_path from mount dispatch or single-app defaults.
+-spec asgi_paths(binary(), map()) -> {binary(), binary()}.
+asgi_paths(Path, State) ->
+    {maps:get(path_info, State, Path), maps:get(script_name, State, <<>>)}.
 
 %% @doc URL scheme for the listener that accepted the request.
 %%
