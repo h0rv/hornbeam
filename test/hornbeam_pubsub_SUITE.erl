@@ -43,7 +43,9 @@
     test_subscriber_receives_messages/1,
     test_unsubscribed_no_messages/1,
     test_binary_topic/1,
-    test_tuple_topic/1
+    test_tuple_topic/1,
+    test_concurrent_session_registration/1,
+    test_session_table_survives_registrant/1
 ]).
 
 all() ->
@@ -51,6 +53,8 @@ all() ->
 
 groups() ->
     [{pubsub, [sequence], [
+        test_session_table_survives_registrant,
+        test_concurrent_session_registration,
         test_subscribe_unsubscribe,
         test_publish_single_subscriber,
         test_publish_multiple_subscribers,
@@ -89,6 +93,83 @@ end_per_testcase(_TestCase, _Config) ->
 %%% ============================================================================
 %%% Test cases
 %%% ============================================================================
+
+test_session_table_survives_registrant(_Config) ->
+    Owner = whereis(hornbeam_sup),
+    ?assertEqual(Owner, ets:info(hornbeam_ws_sessions, owner)),
+    Parent = self(),
+    Session = term_to_binary(make_ref()),
+    {Pid, Ref} = spawn_monitor(fun() ->
+        ok = hornbeam_websocket:register_session(Session, self()),
+        Parent ! {registered, self()},
+        receive stop -> ok end
+    end),
+    try
+        receive {registered, Pid} -> ok after 5000 -> error(registration_timeout) end,
+        ?assertEqual([{Session, Pid}], ets:lookup(hornbeam_ws_sessions, Session)),
+        Pubsub = whereis(hornbeam_pubsub),
+        Monitor = erlang:monitor(process, Pubsub),
+        exit(Pubsub, kill),
+        receive {'DOWN', Monitor, process, Pubsub, killed} -> ok
+        after 5000 -> error(pubsub_exit_timeout) end,
+        await_pubsub_restart(Pubsub, 500),
+        ?assertEqual(Owner, ets:info(hornbeam_ws_sessions, owner)),
+        ?assertEqual([{Session, Pid}], ets:lookup(hornbeam_ws_sessions, Session)),
+        Pid ! stop,
+        receive {'DOWN', Ref, process, Pid, normal} -> ok
+        after 5000 -> error(registrant_exit_timeout) end,
+        ?assertEqual(Owner, ets:info(hornbeam_ws_sessions, owner)),
+        ?assertEqual([{Session, Pid}], ets:lookup(hornbeam_ws_sessions, Session)),
+        ok = hornbeam_websocket:unregister_session(Session),
+        ?assertEqual([], ets:lookup(hornbeam_ws_sessions, Session)),
+        ?assertEqual({error, session_not_found}, hornbeam_websocket:subscribe(Session, missing))
+    after
+        exit(Pid, kill),
+        erlang:demonitor(Ref, [flush]),
+        hornbeam_websocket:unregister_session(Session)
+    end.
+
+test_concurrent_session_registration(_Config) ->
+    Parent = self(),
+    Sessions = [begin
+        Session = term_to_binary(make_ref()),
+        {Pid, Ref} = spawn_monitor(fun() ->
+            Parent ! {ready, self()},
+            receive register -> ok end,
+            ok = hornbeam_websocket:register_session(Session, self())
+        end),
+        {Session, Pid, Ref}
+    end || _ <- lists:seq(1, 256)],
+    try
+        lists:foreach(fun({_, Pid, _}) ->
+            receive {ready, Pid} -> ok after 5000 -> error(barrier_timeout) end
+        end, Sessions),
+        lists:foreach(fun({_, Pid, _}) -> Pid ! register end, Sessions),
+        lists:foreach(fun({Session, Pid, Ref}) ->
+            receive {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+            after 5000 -> error(registration_timeout) end,
+            ?assertEqual([{Session, Pid}], ets:lookup(hornbeam_ws_sessions, Session))
+        end, Sessions),
+        ?assertEqual(whereis(hornbeam_sup), ets:info(hornbeam_ws_sessions, owner))
+    after
+        lists:foreach(fun({Session, Pid, Ref}) ->
+            exit(Pid, kill),
+            erlang:demonitor(Ref, [flush]),
+            hornbeam_websocket:unregister_session(Session)
+        end, Sessions)
+    end.
+
+await_pubsub_restart(_Previous, 0) ->
+    error(pubsub_restart_timeout);
+await_pubsub_restart(Previous, Remaining) ->
+    case whereis(hornbeam_pubsub) of
+        Pid when is_pid(Pid), Pid =/= Previous ->
+            _ = sys:get_state(Pid),
+            ok;
+        _ ->
+            timer:sleep(10),
+            await_pubsub_restart(Previous, Remaining - 1)
+    end.
 
 test_subscribe_unsubscribe(_Config) ->
     Topic = test_topic_1,
