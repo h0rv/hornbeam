@@ -25,6 +25,26 @@ def test_inline_body__untagged_text__should_reject_instead_of_corrupt(
         worker.BodyReceiver(("body", body))
 
 
+@pytest.mark.parametrize("status", [None, 204])
+def test_app_return_without_body__should_send_one_full_response(
+    monkeypatch: pytest.MonkeyPatch, status: int | None
+) -> None:
+    sent: list[object] = []
+
+    async def app(
+        scope: dict[str, object],
+        receive: Callable[[], Awaitable[dict[str, object]]],
+        send: Callable[[dict[str, object]], Awaitable[None]],
+    ) -> None:
+        if status is not None:
+            await send({"type": "http.response.start", "status": status})
+
+    monkeypatch.setattr(worker, "_erlang_send", lambda pid, message: sent.append(message))
+    proto = worker.ASGIProtocol("owner", app, {}, worker.BodyReceiver("empty"))
+    asyncio.run(proto.run())
+    assert sent == [(b"full_response", 500 if status is None else status, [], b"")]
+
+
 @pytest.mark.parametrize("path", ["/caf%C3%A9", b"/caf%C3%A9", b"/bad\xff"])
 @pytest.mark.parametrize("with_extensions", [True, False])
 def test_handle_asgi__should_keep_bytes_and_inject_actual_owner(
@@ -73,4 +93,4 @@ def test_handle_asgi__should_keep_bytes_and_inject_actual_owner(
     asyncio.run(
         worker.handle_asgi(owner, "probe", "app", scope, ("body", "雪".encode()))
     )
-    assert seen == [(b"start_response", 200, [], b"ok"), b"fin"]
+    assert seen == [(b"full_response", 200, [], b"ok")]

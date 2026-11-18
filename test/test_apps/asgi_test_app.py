@@ -100,7 +100,6 @@ async def handle_hello(scope, receive, send):
         'status': 200,
         'headers': [
             [b'content-type', b'text/plain'],
-            [b'content-length', str(len(body)).encode()],
         ],
     })
     await send({

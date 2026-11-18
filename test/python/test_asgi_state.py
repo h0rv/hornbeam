@@ -62,7 +62,7 @@ def test_request_state__should_be_shallow_local_copy(
             await worker.handle_asgi("owner", "probe", "app", scope, "empty")
 
     asyncio.run(exercise())
-    assert messages == [(b"start_response", 200, [], b"ok"), b"fin"] * 2
+    assert messages == [(b"full_response", 200, [], b"ok")] * 2
     assert len(states) == 2
     assert states[0] is not states[1]
     assert lifespan["replace"] == "original"

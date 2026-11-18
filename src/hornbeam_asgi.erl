@@ -16,7 +16,7 @@
 %%%
 %%% Requests run in their own livery request process. The Python task is
 %%% submitted to the event loop pool with this process's pid; response
-%%% events (start_response/chunk/fin/error) arrive as plain messages,
+%%% events (full_response/start_response/chunk/fin/error) arrive as messages,
 %%% request-body chunks as `{livery_body, Ref, _}' messages, and client
 %%% disconnects as `{livery_disconnect, Ref, Reason}' - all handled by
 %%% one selective receive, first as a stream_deferred resolver (choosing
@@ -113,8 +113,10 @@ wait_response(#{req_info := ReqInfo, timeout_ms := TimeoutMs} = St) ->
         {hornbeam_http_output, From, Ref,
          {<<"start_response">>, StatusCode, Headers, FirstChunk}} ->
             start_stream(StatusCode, Headers, FirstChunk, {From, Ref}, St);
-        {<<"start_response">>, StatusCode, Headers, FirstChunk} ->
-            start_stream(StatusCode, Headers, FirstChunk, none, St);
+        {<<"full_response">>, StatusCode, Headers, Body} ->
+            cleanup(St),
+            {Status, SafeHeaders} = response_head(StatusCode, Headers),
+            {full, Status, SafeHeaders, hornbeam_handler:to_binary(Body)};
         {<<"early_hints">>, Headers} ->
             %% Best-effort: h3 (and HTTP/1.0 clients) have no interim
             %% responses, and livery answers {error, unsupported}
@@ -148,11 +150,13 @@ wait_response(#{req_info := ReqInfo, timeout_ms := TimeoutMs} = St) ->
 %%% ============================================================================
 
 start_stream(StatusCode, Headers, FirstChunk, Ack, St) ->
-    SafeHeaders = hornbeam_handler:convert_headers(
-        hornbeam_handler:filter_hop_by_hop(Headers)),
-    Status = hornbeam_handler:parse_status_code(StatusCode),
+    {Status, SafeHeaders} = response_head(StatusCode, Headers),
     {stream, Status, SafeHeaders,
      fun(Emit) -> emit_chunk(Emit, FirstChunk, Ack, St) end}.
+
+response_head(StatusCode, Headers) ->
+    {hornbeam_handler:parse_status_code(StatusCode),
+     hornbeam_handler:convert_headers(hornbeam_handler:filter_hop_by_hop(Headers))}.
 
 %% Ack is the Python sender waiting in output/1, or none for a chunk sent
 %% without flow control. Replying only after Emit returns is what holds a

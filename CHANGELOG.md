@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Complete ASGI responses send headers and body together without starting a
+  stream. Streaming responses still use backpressure.
+
 - **HTTP server moved from cowboy to livery**: hornbeam now serves HTTP
   through [livery](https://github.com/benoitc/livery) instead of cowboy.
   - The listener is owned by a new supervised `hornbeam_listener`
