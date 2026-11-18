@@ -119,10 +119,10 @@ class OutputBackpressureTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.entered.wait()
         self.assertFalse(task.done())
-        self.assertFalse(self.session.close_sent.is_set())
+        self.assertFalse(self.session.close_sent.done())
         self.release.set()
         await task
-        self.assertTrue(self.session.close_sent.is_set())
+        self.assertTrue(self.session.close_sent.done())
         with self.assertRaises(OSError):
             await self.session.send({"type": "websocket.send", "text": "late"})
 

@@ -44,6 +44,7 @@
     test_unsubscribed_no_messages/1,
     test_binary_topic/1,
     test_tuple_topic/1,
+    test_concurrent_path_subscriptions/1,
     test_concurrent_session_registration/1,
     test_session_table_survives_registrant/1
 ]).
@@ -55,6 +56,7 @@ groups() ->
     [{pubsub, [sequence], [
         test_session_table_survives_registrant,
         test_concurrent_session_registration,
+        test_concurrent_path_subscriptions,
         test_subscribe_unsubscribe,
         test_publish_single_subscriber,
         test_publish_multiple_subscribers,
@@ -169,6 +171,36 @@ await_pubsub_restart(Previous, Remaining) ->
         _ ->
             timer:sleep(10),
             await_pubsub_restart(Previous, Remaining - 1)
+    end.
+
+test_concurrent_path_subscriptions(_Config) ->
+    Parent = self(),
+    Topic = <<"busy-path">>,
+    Other = <<"other-path">>,
+    Subscribers = [begin
+        Pid = spawn_link(fun() ->
+            receive join -> ok end,
+            ok = hornbeam_pubsub:subscribe_path(T),
+            Parent ! {joined, self()},
+            receive
+                {pubsub, T, Msg} -> Parent ! {delivered, self(), Msg}
+            end
+        end),
+        {Pid, T}
+    end || T <- lists:duplicate(256, Topic) ++ [Other]],
+    try
+        lists:foreach(fun({Pid, _}) -> Pid ! join end, Subscribers),
+        lists:foreach(fun({Pid, _}) ->
+            receive {joined, Pid} -> ok after 5000 -> error(join_timeout) end
+        end, Subscribers),
+        ?assertEqual(256, hornbeam_pubsub:publish(Topic, busy)),
+        ?assertEqual(1, hornbeam_pubsub:publish(Other, other)),
+        lists:foreach(fun({Pid, T}) ->
+            Expected = case T of Topic -> busy; Other -> other end,
+            receive {delivered, Pid, Expected} -> ok after 5000 -> error(delivery_timeout) end
+        end, Subscribers)
+    after
+        lists:foreach(fun({Pid, _}) -> unlink(Pid), exit(Pid, kill) end, Subscribers)
     end.
 
 test_subscribe_unsubscribe(_Config) ->

@@ -28,8 +28,10 @@
 
 -export([
     start_link/0,
+    start_path_batcher/0,
     subscribe/1,
     subscribe/2,
+    subscribe_path/1,
     subscribe_managed/2,
     is_managed/1,
     unsubscribe/1,
@@ -50,9 +52,13 @@
 ]).
 
 -define(SERVER, ?MODULE).
+-define(PATH_BATCHER, hornbeam_pubsub_path_batcher).
 -define(SCOPE, hornbeam_pubsub_scope).
 -define(MANAGED_GROUP, {?MODULE, managed_guardians}).
 -define(MAX_RELAY_QUEUE, 1024).
+-define(PATH_BATCH_SIZE, 128).
+
+-record(state, {path_joins = #{}, path_count = 0, path_timer = undefined}).
 
 %%% ============================================================================
 %%% API
@@ -61,6 +67,9 @@
 %% @doc Start the pubsub manager.
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+start_path_batcher() ->
+    gen_server:start_link({local, ?PATH_BATCHER}, ?MODULE, path_batcher, []).
 
 %% @doc Subscribe the calling process to a topic.
 -spec subscribe(Topic :: term()) -> ok.
@@ -72,6 +81,10 @@ subscribe(Topic) ->
 subscribe(Topic, Pid) ->
     pg:join(?SCOPE, Topic, Pid),
     ok.
+
+-spec subscribe_path(binary()) -> ok.
+subscribe_path(Topic) ->
+    gen_server:call(?PATH_BATCHER, {subscribe_path, Topic}, infinity).
 
 %% Mark before exposing topic membership. The marker is owned by pg, not
 %% the service ETS owner, and is removed only when the guardian dies. Even
@@ -153,15 +166,34 @@ init([]) ->
         {ok, _Pid} -> ok;
         {error, {already_started, _Pid}} -> ok
     end,
-    {ok, #{}}.
+    {ok, #{}};
+init(path_batcher) ->
+    {ok, #state{}}.
 
+handle_call({subscribe_path, Topic}, From,
+            #state{path_joins = Joins, path_count = Count, path_timer = Timer} = State) ->
+    Next = State#state{
+        path_joins = maps:update_with(Topic, fun(Waiting) -> [From | Waiting] end, [From], Joins),
+        path_count = Count + 1
+    },
+    case Count + 1 of
+        ?PATH_BATCH_SIZE ->
+            erlang:cancel_timer(Timer),
+            {noreply, flush_path_joins(Next)};
+        1 ->
+            {noreply, Next#state{path_timer = erlang:start_timer(1, self(), path_joins)}};
+        _ ->
+            {noreply, Next}
+    end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-handle_info({publish, Topic, Message}, State) ->
+handle_info({timeout, Timer, path_joins}, #state{path_timer = Timer} = State) ->
+    {noreply, flush_path_joins(State)};
+handle_info({publish, Topic, Message}, #{} = State) ->
     Managed = maps:from_keys(pg:get_local_members(?SCOPE, ?MANAGED_GROUP), true),
     Members = [Pid || Pid <- pg:get_local_members(?SCOPE, Topic),
                       maps:is_key(Pid, Managed)],
@@ -178,6 +210,15 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+flush_path_joins(State = #state{path_joins = Joins}) ->
+    %% pg rewrites the group's membership lists on every call. Join a
+    %% burst together, but acknowledge only after membership is visible.
+    maps:foreach(fun(Topic, Waiting) ->
+        ok = pg:join(?SCOPE, Topic, [Pid || {Pid, _} <- Waiting]),
+        lists:foreach(fun(From) -> gen_server:reply(From, ok) end, Waiting)
+    end, Joins),
+    State#state{path_joins = #{}, path_count = 0, path_timer = undefined}.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.

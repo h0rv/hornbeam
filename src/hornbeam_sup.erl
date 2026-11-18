@@ -106,6 +106,14 @@ init([]) ->
             modules => [hornbeam_pubsub]
         },
         #{
+            id => hornbeam_pubsub_path_batcher,
+            start => {hornbeam_pubsub, start_path_batcher, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [hornbeam_pubsub]
+        },
+        #{
             id => hornbeam_services,
             start => {hornbeam_services, start_link, []},
             restart => permanent,

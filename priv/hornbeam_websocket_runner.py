@@ -78,17 +78,23 @@ class WebSocketSession:
         self.closed = False
         self.disconnected = False
         self.disconnect_code = 1006
-        self.close_sent = asyncio.Event()
+        self.close_sent: asyncio.Future[None] = (
+            asyncio.get_running_loop().create_future()
+        )
 
     def emit(self, message: object) -> None:
         erlang.send(self.owner, message)
+
+    def signal_close_sent(self) -> None:
+        if not self.close_sent.done():
+            self.close_sent.set_result(None)
 
     async def abort_output(self) -> None:
         if self.output_aborted:
             return
         self.output_aborted = True
         self.closed = True
-        self.close_sent.set()
+        self.signal_close_sent()
         try:
             async with asyncio.timeout(_OUTPUT_TIMEOUT):
                 await erlang.async_call(
@@ -196,7 +202,7 @@ class WebSocketSession:
         try:
             await self.output((b"websocket_close", code, reason), closing=True)
         finally:
-            self.close_sent.set()
+            self.signal_close_sent()
 
     async def pump_input(self) -> None:
         """Observe disconnect even when the app never calls receive again."""
@@ -248,18 +254,14 @@ class WebSocketSession:
 
         # All children are retained, cancelled and awaited before this task
         # returns. No finished app is ever invoked a second time.
-        async def invoke_app() -> None:
-            await app(scope, self.receive, self.send)
-
-        app_task = asyncio.create_task(invoke_app())
+        app_task = asyncio.create_task(_invoke_app(app, scope, self.receive, self.send))
         input_task = asyncio.create_task(self.pump_input())
-        close_task = asyncio.create_task(self.close_sent.wait())
-        tasks = (app_task, input_task, close_task)
+        tasks = (app_task, input_task, self.close_sent)
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             if input_task in done:
                 input_task.result()
-            if input_task in done or close_task in done:
+            if input_task in done or self.close_sent in done:
                 # Application close can race an awaited finally block. Allow
                 # cooperative completion before cancelling an unresponsive app.
                 await asyncio.wait((app_task,), timeout=_DISCONNECT_GRACE)
@@ -278,6 +280,10 @@ class WebSocketSession:
                     task.cancel()
             # Await each child even if another child failed during cleanup.
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _invoke_app(app: App, scope: Message, receive: Receive, send: Send) -> None:
+    await app(scope, receive, send)
 
 
 async def handle_websocket(
