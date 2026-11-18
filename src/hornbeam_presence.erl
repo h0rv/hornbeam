@@ -18,7 +18,15 @@
 %%% - Track/untrack operations per topic
 %%% - Process monitoring for automatic cleanup
 %%% - CRDT-based conflict resolution (ORSWOT - Observed Remove Set Without Tombstones)
-%%% - Delta-based sync across nodes via pubsub
+%%% - Delta-based sync across nodes
+%%%
+%%% Each node owns the entries it tracked: only the owner adds or removes
+%%% them, and the other nodes hold replicas. When nodes connect they send
+%%% each other their own entries, which replace any older replica, and a
+%%% node that disconnects or stops takes its entries with it. Late joins,
+%%% healed network splits and restarted nodes all converge the same way.
+%%% Every node announces changes to its own subscribers only, so each
+%%% subscriber sees one presence_diff per change.
 %%%
 %%% ORSWOT provides strong eventual consistency even with concurrent
 %%% track/untrack operations across nodes.
@@ -55,8 +63,6 @@
 
 -define(SERVER, ?MODULE).
 -define(SYNC_INTERVAL, 1500).  % Delta sync interval in ms
--define(CLOCK_INTERVAL, 5000). % Clock sync interval in ms
--define(SYNC_TOPIC, <<"hornbeam:presence:sync">>).
 
 %% ORSWOT CRDT - Observed Remove Set Without Tombstones
 -record(orswot, {
@@ -89,8 +95,7 @@
 -record(state, {
     node :: node(),
     topics = #{} :: map(),  % #{Topic => #topic_state{}}
-    sync_timer :: reference() | undefined,
-    clock_timer :: reference() | undefined
+    sync_timer :: reference() | undefined
 }).
 
 %%% ============================================================================
@@ -101,7 +106,7 @@
 %%
 %% The CRDT state is per-node and rebuilt by tracking, so a stopped
 %% server should not keep answering `list/1' with the previous run's
-%% members. Remote state arrives again on the next sync.
+%% members. The other nodes send their entries again.
 -spec clear() -> ok.
 clear() ->
     gen_server:call(?SERVER, clear).
@@ -164,18 +169,10 @@ push_state(Topic, Pid) ->
 %%% ============================================================================
 
 init([]) ->
-    %% Subscribe to sync topic for cross-node updates
-    hornbeam_pubsub:subscribe(?SYNC_TOPIC, self()),
-
-    %% Start timers
+    ok = net_kernel:monitor_nodes(true),
+    request_states(),
     SyncTimer = erlang:send_after(?SYNC_INTERVAL, self(), sync_delta),
-    ClockTimer = erlang:send_after(?CLOCK_INTERVAL, self(), sync_clocks),
-
-    {ok, #state{
-        node = node(),
-        sync_timer = SyncTimer,
-        clock_timer = ClockTimer
-    }}.
+    {ok, #state{node = node(), sync_timer = SyncTimer}}.
 
 handle_call(clear, _From, #state{topics = Topics} = State) ->
     %% Release every monitor before dropping the topics that hold them,
@@ -184,6 +181,7 @@ handle_call(clear, _From, #state{topics = Topics} = State) ->
     _ = [demonitor_pid(Pid, Monitors)
          || #topic_state{monitors = Monitors} <- maps:values(Topics),
             Pid <- maps:keys(Monitors)],
+    request_states(),
     {reply, ok, State#state{topics = #{}}};
 
 handle_call({track, Topic, Pid, Key, Meta}, _From, State) ->
@@ -245,23 +243,29 @@ handle_info(sync_delta, State) ->
     Timer = erlang:send_after(?SYNC_INTERVAL, self(), sync_delta),
     {noreply, NewState#state{sync_timer = Timer}};
 
-handle_info(sync_clocks, State) ->
-    %% Periodic clock sync (currently no-op, but hook for vector clock sync)
-    Timer = erlang:send_after(?CLOCK_INTERVAL, self(), sync_clocks),
-    {noreply, State#state{clock_timer = Timer}};
+handle_info({delta, Topic, Delta}, State) ->
+    {noreply, merge_remote_delta(Topic, Delta, State)};
 
-handle_info({pubsub, ?SYNC_TOPIC, {delta, FromNode, Topic, Delta}}, State)
-        when FromNode =/= node() ->
-    %% Received delta from another node
-    NewState = merge_remote_delta(Topic, Delta, State),
-    {noreply, NewState};
+%% A presence server that started after the connection asks for state.
+handle_info({state_request, FromNode}, State) ->
+    send_state(FromNode, State),
+    {noreply, State};
+
+handle_info({state, FromNode, NodeState}, State) ->
+    {noreply, replace_node(FromNode, NodeState, State)};
+
+handle_info({nodeup, Node}, State) ->
+    send_state(Node, State),
+    {noreply, State};
+
+handle_info({nodedown, Node}, State) ->
+    {noreply, replace_node(Node, #{}, State)};
 
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{sync_timer = SyncTimer, clock_timer = ClockTimer}) ->
+terminate(_Reason, #state{sync_timer = SyncTimer}) ->
     catch erlang:cancel_timer(SyncTimer),
-    catch erlang:cancel_timer(ClockTimer),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -285,6 +289,8 @@ do_track(Topic, Pid, Key, Meta, State) ->
 
     %% Generate unique reference for this presence entry
     HbRef = generate_hb_ref(),
+    %% Clients tell a user's tabs apart by `hb_ref'.
+    RefMeta = Meta#{<<"hb_ref">> => HbRef},
 
     %% Create dot for causal tracking
     NewCounter = Orswot#orswot.counter + 1,
@@ -293,7 +299,7 @@ do_track(Topic, Pid, Key, Meta, State) ->
     %% Add to ORSWOT
     Elements = Orswot#orswot.elements,
     KeyEntries = maps:get(Key, Elements, #{}),
-    NewKeyEntries = KeyEntries#{HbRef => {Meta, Dot}},
+    NewKeyEntries = KeyEntries#{HbRef => {RefMeta, Dot}},
     NewElements = Elements#{Key => NewKeyEntries},
 
     %% Update context
@@ -309,11 +315,11 @@ do_track(Topic, Pid, Key, Meta, State) ->
     %% Add to pending delta
     DeltaAdds = Delta#delta.adds,
     DeltaKeyEntries = maps:get(Key, DeltaAdds, #{}),
-    NewDeltaKeyEntries = DeltaKeyEntries#{HbRef => {Meta, Dot}},
+    NewDeltaKeyEntries = DeltaKeyEntries#{HbRef => {RefMeta, Dot}},
     NewDeltaAdds = DeltaAdds#{Key => NewDeltaKeyEntries},
     NewDelta = Delta#delta{
         adds = NewDeltaAdds,
-        context = NewContext
+        context = #{Node => NewCounter}
     },
 
     %% Monitor the pid
@@ -326,7 +332,7 @@ do_track(Topic, Pid, Key, Meta, State) ->
     },
 
     %% Broadcast presence_diff for local subscribers
-    broadcast_join(Topic, Key, Meta),
+    broadcast_join(Topic, Key, RefMeta),
 
     NewState = State1#state{topics = Topics#{Topic => NewTopicState}},
     {ok, NewState}.
@@ -419,7 +425,7 @@ do_untrack_all(Topic, Pid, #state{topics = Topics} = State) ->
             end
     end.
 
-remove_refs(Key, HbRefs, #orswot{elements = Elements, context = Context} = Orswot, Delta) ->
+remove_refs(Key, HbRefs, #orswot{elements = Elements, counter = Counter} = Orswot, Delta) ->
     KeyEntries = maps:get(Key, Elements, #{}),
 
     %% Collect removed metas and update elements
@@ -442,7 +448,9 @@ remove_refs(Key, HbRefs, #orswot{elements = Elements, context = Context} = Orswo
     %% Add to delta removes
     Removes = Delta#delta.removes,
     NewRemoves = [{Key, Ref} || Ref <- HbRefs] ++ Removes,
-    NewDelta = Delta#delta{removes = NewRemoves, context = Context},
+    %% A delta carries only this node's clock: another node's counter
+    %% seen here could otherwise mark that node's unsent adds as seen.
+    NewDelta = Delta#delta{removes = NewRemoves, context = #{node() => Counter}},
 
     {NewOrswot, RemovedMetas, NewDelta}.
 
@@ -524,13 +532,76 @@ handle_process_down(Pid, #state{topics = Topics} = State) ->
 %%% Internal Functions - Delta Sync
 %%% ============================================================================
 
-broadcast_deltas(#state{topics = Topics, node = Node} = State) ->
+%% Deltas, state requests and states go straight to the presence server
+%% on each connected node. One sender and one receiver keep them in
+%% order, so a delta never overtakes the state it follows.
+send_to_nodes(Message) ->
+    lists:foreach(fun(Node) -> send_to_node(Node, Message) end, nodes()).
+
+send_to_node(Node, Message) ->
+    _ = erlang:send({?SERVER, Node}, Message, [noconnect]),
+    ok.
+
+request_states() ->
+    send_to_nodes({state_request, node()}).
+
+%% This node's own entries and dot counter for every topic it knows.
+send_state(Node, #state{node = Self, topics = Topics}) ->
+    NodeState = maps:map(fun(_Topic, #topic_state{orswot = Orswot}) ->
+        #orswot{elements = Elements, counter = Counter} = Orswot,
+        {node_entries(Self, Elements), Counter}
+    end, Topics),
+    send_to_node(Node, {state, Self, NodeState}).
+
+node_entries(Node, Elements) ->
+    maps:filtermap(fun(_Key, Entries) ->
+        Owned = maps:filter(fun(_Ref, {_Meta, {Owner, _}}) -> Owner =:= Node end,
+                            Entries),
+        maps:size(Owned) > 0 andalso {true, Owned}
+    end, Elements).
+
+%% Replace every replica of `Node''s entries with `NodeState'
+%% (`#{Topic => {Elements, Counter}}'); an empty map drops them all.
+replace_node(Node, NodeState, #state{topics = Topics} = State) ->
+    AllTopics = maps:merge(maps:map(fun(_, _) -> #topic_state{} end, NodeState),
+                           Topics),
+    State#state{topics = maps:map(fun(Topic, TopicState) ->
+        replace_topic(Node, Topic, maps:get(Topic, NodeState, undefined), TopicState)
+    end, AllTopics)}.
+
+replace_topic(Node, Topic, NodeTopic, #topic_state{orswot = Orswot} = TopicState) ->
+    #orswot{elements = Elements, context = Context} = Orswot,
+    {New, NewContext} = case NodeTopic of
+        undefined -> {#{}, maps:remove(Node, Context)};
+        {NodeElements, Counter} -> {NodeElements, Context#{Node => Counter}}
+    end,
+    Old = node_entries(Node, Elements),
+    Kept = maps:filtermap(fun(Key, Entries) ->
+        Rest = maps:without(maps:keys(maps:get(Key, Old, #{})), Entries),
+        maps:size(Rest) > 0 andalso {true, Rest}
+    end, Elements),
+    NewElements = maps:fold(fun(Key, Entries, Acc) ->
+        Acc#{Key => maps:merge(maps:get(Key, Acc, #{}), Entries)}
+    end, Kept, New),
+    lists:foreach(fun({Key, Meta}) -> broadcast_leave(Topic, Key, Meta) end,
+                  missing(Old, New)),
+    lists:foreach(fun({Key, Meta}) -> broadcast_join(Topic, Key, Meta) end,
+                  missing(New, Old)),
+    TopicState#topic_state{
+        orswot = Orswot#orswot{elements = NewElements, context = NewContext}}.
+
+%% `{Key, Meta}' for each entry in `From' that `In' does not have.
+missing(From, In) ->
+    [{Key, Meta} || {Key, Entries} <- maps:to_list(From),
+                    {Ref, {Meta, _Dot}} <- maps:to_list(Entries),
+                    not maps:is_key(Ref, maps:get(Key, In, #{}))].
+
+broadcast_deltas(#state{topics = Topics} = State) ->
     NewTopics = maps:map(fun(Topic, TopicState) ->
         #topic_state{pending_delta = Delta} = TopicState,
         case has_delta(Delta) of
             true ->
-                %% Broadcast delta to other nodes
-                hornbeam_pubsub:publish(?SYNC_TOPIC, {delta, Node, Topic, Delta}),
+                send_to_nodes({delta, Topic, Delta}),
                 %% Clear pending delta
                 TopicState#topic_state{pending_delta = #delta{}};
             false ->
@@ -630,14 +701,14 @@ broadcast_join(Topic, Key, Meta) ->
         <<"joins">> => #{Key => #{<<"metas">> => [Meta]}},
         <<"leaves">> => #{}
     },
-    hornbeam_pubsub:publish(Topic, {presence_diff, Diff}).
+    hornbeam_pubsub:publish_local(Topic, {presence_diff, Diff}).
 
 broadcast_leave(Topic, Key, Meta) ->
     Diff = #{
         <<"joins">> => #{},
         <<"leaves">> => #{Key => #{<<"metas">> => [Meta]}}
     },
-    hornbeam_pubsub:publish(Topic, {presence_diff, Diff}).
+    hornbeam_pubsub:publish_local(Topic, {presence_diff, Diff}).
 
 %%% ============================================================================
 %%% Internal Functions - Utilities

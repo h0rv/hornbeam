@@ -15,8 +15,8 @@
 """Persistent ASGI lifespan execution on Hornbeam's running event-loop pool.
 
 The Erlang manager owns the control channel and the submitted coroutine. No
-private loop is created or paused. Applications sharing loop-bound resources
-with requests require erlang_python.event_loop_pool_size=1 for the MVP.
+private loop is created or paused. Handlers use their mount's lifespan loop
+so loop-bound application resources retain their affinity.
 Request scopes shallow-copy the retained Python state in the shared interpreter,
 preserving resource identity. The startup report also supplies a bridge-converted
 snapshot to the Erlang manager; it is not the source for request state.

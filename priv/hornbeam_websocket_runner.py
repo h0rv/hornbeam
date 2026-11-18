@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 import erlang
+from hornbeam_lifespan_runner import get_state
 
 Message = dict[str, object]
 Receive = Callable[[], Awaitable[Message]]
@@ -299,6 +300,7 @@ async def handle_websocket(
     )
     _sessions[session_id] = session
     scope["session_id"] = session_id
+    scope["state"] = get_state(scope.get("mount_id")).copy()
     try:
         extensions = scope.setdefault("extensions", {})
         if not isinstance(extensions, dict):

@@ -174,7 +174,7 @@ start_asgi(Scope, Opts, State) ->
 submit_asgi(Scope, Opts, #state{input = Input, session_id = SessionId,
                                input_guard = Relay, task_ref = TaskRef} = State) ->
     try
-        {ok, LoopRef} = py_event_loop_pool:get_loop(),
+        {ok, LoopRef} = hornbeam_lifespan:get_loop(maps:get(mount_id, Opts, undefined)),
         ok = py_nif:submit_task(LoopRef, Relay, TaskRef,
             <<"hornbeam_websocket_runner">>, <<"handle_websocket">>,
             [self(), maps:get(app_module, Opts), maps:get(app_callable, Opts),
