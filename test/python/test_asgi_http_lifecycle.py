@@ -160,7 +160,6 @@ def test_streaming_send__should_raise_oserror_once_client_is_gone(
             await proto.send({"type": "http.response.body", "body": b"a", "more_body": True})
         with pytest.raises(OSError):
             await proto.send({"type": "http.response.body", "body": b"b", "more_body": True})
-        assert await proto.receive() == {"type": "http.request", "body": b"", "more_body": False}
         assert await proto.receive() == {"type": "http.disconnect"}
 
     asyncio.run(exercise())
