@@ -7,12 +7,13 @@
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 -export([idle_output_and_owner/1, five_item_arrays_are_asgi/1,
+         compact_scope_preserves_asgi_values/1,
          native_channels_are_explicit/1, mounted_legacy_topics_are_isolated/1,
          shutdown_awaits_asgi_cleanup/1]).
 %% Also act as the ws client's observer handler.
 -export([init/2, handle_in/2, handle_info/2, terminate/2]).
 
-all() -> [idle_output_and_owner, five_item_arrays_are_asgi,
+all() -> [idle_output_and_owner, five_item_arrays_are_asgi, compact_scope_preserves_asgi_values,
           native_channels_are_explicit, mounted_legacy_topics_are_isolated,
           shutdown_awaits_asgi_cleanup].
 
@@ -84,10 +85,13 @@ connect(Config) ->
     connect(Config, "/ws-patch").
 
 connect(Config, Path) ->
+    connect(Config, Path, #{}).
+
+connect(Config, Path, Options) ->
     Port = proplists:get_value(port, Config),
     URL = iolist_to_binary(io_lib:format("ws://127.0.0.1:~p~s", [Port, Path])),
-    {ok, Client} = ws:connect(URL, #{handler => ?MODULE, handler_opts => self(),
-                                   timeout => 5000}),
+    ClientOptions = Options#{handler => ?MODULE, handler_opts => self(), timeout => 5000},
+    {ok, Client} = ws:connect(URL, ClientOptions),
     Client.
 
 next_frame(Client) ->
@@ -153,6 +157,16 @@ five_item_arrays_are_asgi(Config) ->
         Heartbeat = <<"[null,\"2\",\"hornbeam\",\"heartbeat\",{}]">>,
         ok = ws:send(Client, {text, Heartbeat}),
         ?assertEqual({text, <<"echo:", Heartbeat/binary>>}, next_frame(Client))
+    after ws:close(Client, 1000)
+    end.
+
+compact_scope_preserves_asgi_values(Config) ->
+    Client = connect(Config, "/scope-shape", #{
+        extra_headers => [{<<"x-repeat">>, <<"first">>}, {<<"x-repeat">>, <<"second">>}],
+        subprotocols => [<<"first">>, <<"second">>]
+    }),
+    try
+        initial_frames(Client)
     after ws:close(Client, 1000)
     end.
 

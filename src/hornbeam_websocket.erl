@@ -105,8 +105,8 @@ build_websocket_scope(Req, State) ->
     Headers = livery_req:headers(Req),
     {Host, Port} = hornbeam_request:server_info(Req, State),
 
-    %% Convert headers to list of [name, value] pairs
-    HeaderList = [[{bytes, Name}, {bytes, Value}] || {Name, Value} <- Headers],
+    %% Immutable tuples of byte strings do not need repeated Python GC scans.
+    HeaderPairs = list_to_tuple([{{bytes, Name}, {bytes, Value}} || {Name, Value} <- Headers]),
 
     %% Get WebSocket subprotocols from Sec-WebSocket-Protocol header
     Subprotocols = get_subprotocols(Req),
@@ -130,10 +130,10 @@ build_websocket_scope(Req, State) ->
         <<"raw_path">> => {bytes, Path},
         <<"query_string">> => {bytes, livery_req:query(Req)},
         <<"root_path">> => RootPath,
-        <<"headers">> => HeaderList,
-        <<"server">> => [Host, Port],
-        <<"client">> => [<<>>, 0],
-        <<"subprotocols">> => Subprotocols
+        <<"headers">> => HeaderPairs,
+        <<"server">> => {Host, Port},
+        <<"client">> => {<<>>, 0},
+        <<"subprotocols">> => list_to_tuple(Subprotocols)
     },
     case maps:get(mount_id, State, undefined) of
         undefined -> BaseScope;

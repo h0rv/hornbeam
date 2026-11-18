@@ -10,6 +10,22 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 
 
+def assert_compact_scope(scope: Message) -> None:
+    headers = scope["headers"]
+    assert isinstance(headers, tuple)
+    assert all(isinstance(pair, tuple) for pair in headers)
+    assert tuple(value for name, value in headers if name == b"x-repeat") == (
+        b"first",
+        b"second",
+    )
+    assert scope["subprotocols"] == ("first", "second")
+    for field in ("client", "server"):
+        address = scope[field]
+        assert isinstance(address, tuple) and len(address) == 2
+        assert address[0] == "127.0.0.1"
+        assert isinstance(address[1], int) and address[1] > 0
+
+
 async def app(scope: Message, receive: Receive, send: Send) -> None:
     if scope["type"] != "websocket":
         await send({"type": "http.response.start", "status": 200})
@@ -17,6 +33,8 @@ async def app(scope: Message, receive: Receive, send: Send) -> None:
         return
     assert await receive() == {"type": "websocket.connect"}
     assert "method" not in scope
+    if scope["path"] == "/scope-shape":
+        assert_compact_scope(scope)
     await send({"type": "websocket.accept"})
     await send({"type": "websocket.send", "text": "welcome"})
     extensions = scope["extensions"]

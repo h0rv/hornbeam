@@ -42,7 +42,7 @@ init(Req, Opts) ->
     Scope0 = maps:get(scope, Opts),
     Scope1 = case maps:get(peer, Req, undefined) of
         {Ip, Port} ->
-            Scope0#{<<"client">> => [hornbeam_request:format_ip(Ip), Port]};
+            Scope0#{<<"client">> => {hornbeam_request:format_ip(Ip), Port}};
         _ -> Scope0
     end,
     Extensions = maps:get(<<"extensions">>, Scope1, #{}),
