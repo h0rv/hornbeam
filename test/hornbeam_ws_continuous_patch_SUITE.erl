@@ -7,12 +7,14 @@
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 -export([idle_output_and_owner/1, five_item_arrays_are_asgi/1,
-         native_channels_are_explicit/1, mounted_legacy_topics_are_isolated/1]).
+         native_channels_are_explicit/1, mounted_legacy_topics_are_isolated/1,
+         shutdown_awaits_asgi_cleanup/1]).
 %% Also act as the ws client's observer handler.
 -export([init/2, handle_in/2, handle_info/2, terminate/2]).
 
 all() -> [idle_output_and_owner, five_item_arrays_are_asgi,
-          native_channels_are_explicit, mounted_legacy_topics_are_isolated].
+          native_channels_are_explicit, mounted_legacy_topics_are_isolated,
+          shutdown_awaits_asgi_cleanup].
 
 init_per_suite(Config) ->
     application:load(hornbeam),
@@ -37,6 +39,12 @@ init_per_testcase(Test, Config) ->
         _ -> Options
     end,
     case Test of
+        shutdown_awaits_asgi_cleanup ->
+            Marker = filename:join(proplists:get_value(priv_dir, Config), "ws-shutdown.log"),
+            hornbeam:register_function(ws_shutdown_record, fun([Event]) ->
+                file:write_file(Marker, [Event, <<"\n">>], [append])
+            end),
+            ok = hornbeam:start("ws_shutdown_app:app", Options#{lifespan => on});
         mounted_legacy_topics_are_isolated ->
             ok = hornbeam:start(Selected#{mounts => [
                 {<<"/">>, "ws_continuous_patch_app:app", #{worker_class => asgi}},
@@ -46,6 +54,9 @@ init_per_testcase(Test, Config) ->
     end,
     [{port, Port} | Config].
 
+end_per_testcase(shutdown_awaits_asgi_cleanup, _Config) ->
+    hornbeam:stop(),
+    hornbeam:unregister_function(ws_shutdown_record);
 end_per_testcase(_Test, _Config) ->
     hornbeam:stop().
 
@@ -58,6 +69,16 @@ test_apps_dir() ->
             filename:join(Root, "test/test_apps");
         {error, _} -> filename:absname("test/test_apps")
     end.
+
+shutdown_awaits_asgi_cleanup(Config) ->
+    Client = connect(Config, "/shutdown"),
+    try
+        ?assertEqual({text, <<"ready">>}, next_frame(Client)),
+        ok = hornbeam:stop(),
+        Marker = filename:join(proplists:get_value(priv_dir, Config), "ws-shutdown.log"),
+        ?assertEqual({ok, <<"closed\nshutdown\n">>}, file:read_file(Marker)),
+        ?assertEqual([], ets:tab2list(hornbeam_ws_tasks))
+    after ws:close(Client, 1000) end.
 
 connect(Config) ->
     connect(Config, "/ws-patch").

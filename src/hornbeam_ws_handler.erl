@@ -150,6 +150,7 @@ start_asgi(Scope, Opts, State) ->
             RelayState = State#state{input = Input, task_ref = TaskRef,
                                      max_output_frame = MaxFrame},
             Guard = spawn(fun() -> relay_output(Owner, RelayState) end),
+            hornbeam_websocket:register_task(Guard),
             State1 = State#state{input = Input, input_guard = Guard,
                                  task_ref = TaskRef},
             case submit_asgi(Scope, Opts, State1) of
@@ -164,6 +165,7 @@ start_asgi(Scope, Opts, State) ->
                     {ok, State2};
                 {error, Reason} ->
                     close_input(State1),
+                    Guard ! {async_result, TaskRef, {ok, not_submitted}},
                     hornbeam_websocket:unregister_session(State#state.session_id),
                     error_logger:error_msg("WebSocket init error: ~p~n", [Reason]),
                     {stop, ws_init_failed, State1}
@@ -199,16 +201,24 @@ output([Owner, Relay, Message]) when is_pid(Owner), is_pid(Relay) ->
 
 relay_output(Owner, State) ->
     Ref = erlang:monitor(process, Owner),
-    relay_output(Owner, Ref, State).
+    try relay_output(Owner, Ref, State)
+    after hornbeam_websocket:unregister_task(self()) end.
 
 relay_output(Owner, Ref, #state{input = Input, task_ref = TaskRef} = State) ->
     receive
+        shutdown ->
+            py_channel:close(Input),
+            ws_session:close(Owner, 1001),
+            erlang:demonitor(Ref, [flush]),
+            drain_output(TaskRef);
         {'DOWN', Ref, process, Owner, _} ->
             py_channel:close(Input),
-            hornbeam_websocket:unregister_session(State#state.session_id);
+            hornbeam_websocket:unregister_session(State#state.session_id),
+            drain_output(TaskRef);
         stop ->
             erlang:demonitor(Ref, [flush]),
-            py_channel:close(Input);
+            py_channel:close(Input),
+            drain_output(TaskRef);
         {'$gen_call', From, {output, Message}} ->
             case relay_send(Owner, Message, State) of
                 {ok, State1} ->
@@ -218,7 +228,8 @@ relay_output(Owner, Ref, #state{input = Input, task_ref = TaskRef} = State) ->
                     _ = ws_session:abort(Owner),
                     py_channel:close(Input),
                     hornbeam_websocket:unregister_session(State#state.session_id),
-                    gen_server:reply(From, 0)
+                    gen_server:reply(From, 0),
+                    drain_output(TaskRef)
             end;
         Info ->
             case relay_send(Owner, Info, State) of
@@ -232,8 +243,25 @@ relay_output(Owner, Ref, #state{input = Input, task_ref = TaskRef} = State) ->
                 {error, _} ->
                     _ = ws_session:abort(Owner),
                     py_channel:close(Input),
-                    hornbeam_websocket:unregister_session(State#state.session_id)
+                    hornbeam_websocket:unregister_session(State#state.session_id),
+                    drain_output(TaskRef)
             end
+    end.
+
+drain_output(TaskRef) ->
+    drain_output(TaskRef, erlang:monotonic_time(millisecond) + ?OUTPUT_TIMEOUT).
+
+drain_output(TaskRef, Deadline) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {async_result, TaskRef, {ok, _}} -> ok;
+        {async_result, TaskRef, {error, Reason}} ->
+            error_logger:error_msg("WebSocket task failed during cleanup: ~p~n", [Reason]);
+        {'$gen_call', From, {output, _}} ->
+            gen_server:reply(From, 0),
+            drain_output(TaskRef, Deadline)
+    after Remaining ->
+        logger:warning("WebSocket application cleanup timed out")
     end.
 
 relay_send(_Owner, {<<"websocket_send">>, _, Data},
