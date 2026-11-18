@@ -11,6 +11,7 @@ presence_test_() ->
         fun owner_death/0,
         fun service_death/0,
         fun presence_engine_death/0,
+        fun presence_restart_before_guardian_initialization/0,
         fun canceled_and_invalid_opens/0
     ]}.
 
@@ -168,3 +169,50 @@ canceled_and_invalid_opens() ->
     ?assertEqual({<<"error">>, <<"invalid_arguments">>}, hornbeam_services:call(<<"presence">>,
         [self(), <<2:128>>, <<"online">>, <<>>, <<>>, 1024])),
     ?assertEqual(#{}, hornbeam_presence:list(<<"online">>)).
+
+presence_restart_before_guardian_initialization() ->
+    Schedulers = erlang:system_flag(schedulers_online, 1),
+    Priority = process_flag(priority, high),
+    Services = whereis(hornbeam_services),
+    ServicePriority = set_priority(Services, high),
+    Scope = whereis(hornbeam_pubsub_scope),
+    ScopePriority = set_priority(Scope, high),
+    OldPresence = whereis(hornbeam_presence),
+    set_priority(OldPresence, high),
+    try
+        %% Replace the engine before the guardian installs its presence monitor.
+        Ch = open(self(), 1, <<"one">>, <<>>, 1024),
+        [Guardian] = hornbeam_pubsub:get_members(<<"online">>),
+        true = erlang:suspend_process(Guardian),
+        try
+            {monitors, Monitors} = process_info(Guardian, monitors),
+            ?assertEqual([], Monitors -- [{process, self()}, {process, Services}]),
+            PresenceMonitor = monitor(process, OldPresence),
+            exit(OldPresence, kill),
+            receive {'DOWN', PresenceMonitor, process, OldPresence, killed} -> ok
+            after 1000 -> error(presence_did_not_stop) end,
+            {ok, Replacement} = gen_server:start({local, hornbeam_presence},
+                hornbeam_presence, [], [{spawn_opt, [{priority, high}]}]),
+            ?assertNotEqual(OldPresence, Replacement),
+            ?assertEqual({monitors, Monitors}, process_info(Guardian, monitors)),
+            ?assertEqual(#{}, hornbeam_presence:list(<<"online">>))
+        after erlang:resume_process(Guardian) end,
+        process_flag(priority, normal),
+        eventually(fun() -> maps:get(closed, py_channel:info(Ch)) end),
+        eventually(fun() -> value(<<"subscription_count">>, []) =:= 0 end),
+        ?assertEqual(<<"closed">>, status(self(), 1))
+    after
+        set_priority(Services, ServicePriority),
+        set_priority(Scope, ScopePriority),
+        case whereis(hornbeam_presence) of
+            undefined -> ok;
+            Pid -> set_priority(Pid, normal)
+        end,
+        process_flag(priority, Priority),
+        erlang:system_flag(schedulers_online, Schedulers)
+    end.
+
+set_priority(Server, Priority) ->
+    {priority, Previous} = process_info(Server, priority),
+    _ = sys:replace_state(Server, fun(State) -> process_flag(priority, Priority), State end),
+    Previous.

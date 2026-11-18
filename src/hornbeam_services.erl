@@ -377,9 +377,13 @@ open_channel(Owner, Token, Topic0, MaxBytes, Kind, State) ->
             Flag = atomics:new(3, [{signed, false}]),
             atomics:put(Flag, 1, ?OPEN),
             case Kind of {presence, _, _} -> atomics:put(Flag, 3, 1); bytes -> ok end,
+            Presence = case Kind of
+                bytes -> undefined;
+                {presence, _, _} -> whereis(hornbeam_presence)
+            end,
             Service = self(),
             {Pid, Ref} = spawn_monitor(fun() ->
-                guardian(Service, Owner, Topic, Channel, Flag, MaxBytes)
+                guardian(Service, Owner, Topic, Channel, Flag, MaxBytes, Presence)
             end),
             Entry = #{owner => Owner, token => binary:copy(Token), topic => Topic,
                       max_bytes => MaxBytes, channel => Channel, flag => Flag, pid => Pid},
@@ -388,19 +392,21 @@ open_channel(Owner, Token, Topic0, MaxBytes, Kind, State) ->
             ok = hornbeam_pubsub:subscribe_managed(Topic, Pid),
             Next = put_token(Owner, Token, Entry, State),
             Opened = Next#state{guardians = (Next#state.guardians)#{Ref => Entry}},
-            case register_presence(Kind, Topic, Pid) of
+            case register_presence(Kind, Topic, Pid, Presence) of
                 ok -> {success(Channel), Opened};
                 {error, _} -> {failure(<<"unavailable">>), finish_entry(Entry, ?CLOSED, Opened)}
             end;
         {error, _} -> {failure(<<"channel_unavailable">>), State}
     end.
 
-register_presence(bytes, _, _) -> ok;
-register_presence({presence, Key, Payload}, Topic, Pid) ->
-    try hornbeam_presence:track(Topic, Pid, Key, #{<<"hornbeam_services_payload">> => Payload}) of
+register_presence(bytes, _, _, _) -> ok;
+register_presence({presence, Key, Payload}, Topic, Pid, Presence) when is_pid(Presence) ->
+    try gen_server:call(Presence,
+            {track, Topic, Pid, Key, #{<<"hornbeam_services_payload">> => Payload}}) of
         ok -> ok;
         Error -> Error
-    catch exit:Reason -> {error, Reason} end.
+    catch exit:Reason -> {error, Reason} end;
+register_presence(_, _, _, _) -> {error, unavailable}.
 
 %% Coalesce diffs before the guardian mailbox, not after an unbounded enqueue.
 presence_changed(Pid, Flag) ->
@@ -528,12 +534,12 @@ close_entry(#{pid := Pid, topic := Topic, channel := Channel, flag := Flag}, Rea
     Pid ! subscription_terminal,
     ok.
 
-guardian(Service, Owner, Topic, Channel, Flag, MaxBytes) ->
+guardian(Service, Owner, Topic, Channel, Flag, MaxBytes, Presence) ->
     ServiceRef = monitor(process, Service),
     OwnerRef = monitor(process, Owner),
-    PresenceRef = case atomics:get(Flag, 3) of
-        1 -> monitor(process, {hornbeam_presence, node()});
-        0 -> undefined
+    PresenceRef = case Presence of
+        undefined -> undefined;
+        _ -> monitor(process, Presence)
     end,
     guardian_loop(ServiceRef, OwnerRef, PresenceRef, Topic, Channel, Flag, MaxBytes).
 guardian_loop(ServiceRef, OwnerRef, PresenceRef, Topic, Channel, Flag, MaxBytes) ->
