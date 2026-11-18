@@ -2,10 +2,10 @@
 -include_lib("stdlib/include/assert.hrl").
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2, http/1, websocket/1,
-         mounted_http/1, mounted_websocket/1, fallback/1]).
+         mounted_http/1, mounted_websocket/1, mounted_websocket_route/1, fallback/1]).
 -export([init/2, handle_in/2, handle_info/2, terminate/2]).
 
-all() -> [http, websocket, mounted_http, mounted_websocket, fallback].
+all() -> [http, websocket, mounted_http, mounted_websocket, mounted_websocket_route, fallback].
 
 init_per_suite(Config) ->
     application:load(erlang_python),
@@ -30,6 +30,9 @@ init_per_testcase(Test, Config) ->
         worker_class => asgi, lifespan => on, websocket_protocol => asgi,
         pythonpath => [test_apps_dir()]},
     case Test of
+        mounted_websocket_route ->
+            ok = hornbeam:start(Options#{mounts => [
+                {<<"/api">>, "lifespan_affinity_app:routed_app", #{worker_class => asgi}}]});
         T when T =:= mounted_http; T =:= mounted_websocket ->
             ok = hornbeam:start(Options#{mounts => [
                 {<<"/first">>, "lifespan_affinity_app:app", #{worker_class => asgi}},
@@ -68,6 +71,9 @@ websocket(Config) -> websocket(Config, "/").
 mounted_websocket(Config) ->
     websocket(Config, "/first/"),
     websocket(Config, "/second/").
+
+mounted_websocket_route(Config) ->
+    websocket(Config, "/api/ws").
 
 websocket(Config, Path) ->
     Port = proplists:get_value(port, Config),
