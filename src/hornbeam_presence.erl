@@ -289,6 +289,8 @@ do_track(Topic, Pid, Key, Meta, State) ->
 
     %% Generate unique reference for this presence entry
     HbRef = generate_hb_ref(),
+    %% Clients tell a user's tabs apart by `hb_ref'.
+    RefMeta = Meta#{<<"hb_ref">> => HbRef},
 
     %% Create dot for causal tracking
     NewCounter = Orswot#orswot.counter + 1,
@@ -297,7 +299,7 @@ do_track(Topic, Pid, Key, Meta, State) ->
     %% Add to ORSWOT
     Elements = Orswot#orswot.elements,
     KeyEntries = maps:get(Key, Elements, #{}),
-    NewKeyEntries = KeyEntries#{HbRef => {Meta, Dot}},
+    NewKeyEntries = KeyEntries#{HbRef => {RefMeta, Dot}},
     NewElements = Elements#{Key => NewKeyEntries},
 
     %% Update context
@@ -313,11 +315,11 @@ do_track(Topic, Pid, Key, Meta, State) ->
     %% Add to pending delta
     DeltaAdds = Delta#delta.adds,
     DeltaKeyEntries = maps:get(Key, DeltaAdds, #{}),
-    NewDeltaKeyEntries = DeltaKeyEntries#{HbRef => {Meta, Dot}},
+    NewDeltaKeyEntries = DeltaKeyEntries#{HbRef => {RefMeta, Dot}},
     NewDeltaAdds = DeltaAdds#{Key => NewDeltaKeyEntries},
     NewDelta = Delta#delta{
         adds = NewDeltaAdds,
-        context = NewContext
+        context = #{Node => NewCounter}
     },
 
     %% Monitor the pid
@@ -330,7 +332,7 @@ do_track(Topic, Pid, Key, Meta, State) ->
     },
 
     %% Broadcast presence_diff for local subscribers
-    broadcast_join(Topic, Key, Meta),
+    broadcast_join(Topic, Key, RefMeta),
 
     NewState = State1#state{topics = Topics#{Topic => NewTopicState}},
     {ok, NewState}.
@@ -423,7 +425,7 @@ do_untrack_all(Topic, Pid, #state{topics = Topics} = State) ->
             end
     end.
 
-remove_refs(Key, HbRefs, #orswot{elements = Elements, context = Context} = Orswot, Delta) ->
+remove_refs(Key, HbRefs, #orswot{elements = Elements, counter = Counter} = Orswot, Delta) ->
     KeyEntries = maps:get(Key, Elements, #{}),
 
     %% Collect removed metas and update elements
@@ -446,7 +448,9 @@ remove_refs(Key, HbRefs, #orswot{elements = Elements, context = Context} = Orswo
     %% Add to delta removes
     Removes = Delta#delta.removes,
     NewRemoves = [{Key, Ref} || Ref <- HbRefs] ++ Removes,
-    NewDelta = Delta#delta{removes = NewRemoves, context = Context},
+    %% A delta carries only this node's clock: another node's counter
+    %% seen here could otherwise mark that node's unsent adds as seen.
+    NewDelta = Delta#delta{removes = NewRemoves, context = #{node() => Counter}},
 
     {NewOrswot, RemovedMetas, NewDelta}.
 

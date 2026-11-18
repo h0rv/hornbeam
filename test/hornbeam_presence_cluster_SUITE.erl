@@ -43,6 +43,11 @@ test_multiple_tabs(_Config) ->
         close_tab(A, Tab1),
         Two = #{<<"user:1">> => [<<"a-2">>, <<"b-1">>]},
         await_all(Nodes, Two),
+        lists:foreach(fun({Peer, _}) ->
+            #{<<"user:1">> := #{<<"metas">> := Metas}} =
+                peer:call(Peer, hornbeam_presence, list, [?TOPIC]),
+            ?assertEqual(2, length(lists:usort([Ref || #{<<"hb_ref">> := Ref} <- Metas])))
+        end, Nodes),
         Diffs = watcher_diffs(Watcher, Nodes, Two),
         ?assertEqual(#{joins => [<<"a-1">>, <<"a-2">>, <<"b-1">>],
                        leaves => [<<"a-1">>]}, Diffs)
