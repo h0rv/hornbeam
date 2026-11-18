@@ -142,7 +142,6 @@ get_value(Value, _Default) -> Value.
 %% @doc Register a WebSocket session (called from hornbeam_ws_handler).
 -spec register_session(binary(), pid()) -> ok.
 register_session(SessionId, Pid) ->
-    _ = ensure_session_table(),
     ets:insert(?SESSION_TABLE, {SessionId, Pid}),
     error_logger:info_msg("WS register: session=~p pid=~p~n", [SessionId, Pid]),
     ok.
@@ -189,17 +188,7 @@ publish(Topic, Message) ->
 
 %% @private
 lookup_session(SessionId) ->
-    _ = ensure_session_table(),
     case ets:lookup(?SESSION_TABLE, SessionId) of
         [{_, Pid}] -> {ok, Pid};
         [] -> error
-    end.
-
-%% @private
-ensure_session_table() ->
-    case ets:whereis(?SESSION_TABLE) of
-        undefined ->
-            ets:new(?SESSION_TABLE, [named_table, public, set, {read_concurrency, true}]);
-        _ ->
-            ok
     end.
