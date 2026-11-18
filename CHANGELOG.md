@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Linux HTTP/1 connections release streaming requests after 20 seconds of
+  unacknowledged output, rather than waiting for the system TCP retry limit.
+  Healthy streams are not given a maximum lifetime.
+
 - Cross-node pub/sub delivers managed subscriptions on their guardian's node,
   so remote subscribers receive channel bytes instead of silently losing messages.
 
