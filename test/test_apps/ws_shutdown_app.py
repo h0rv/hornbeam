@@ -22,8 +22,8 @@ async def app(scope: Message, receive: Receive, send: Send) -> None:
     elif scope["type"] == "websocket":
         await receive()
         await send({"type": "websocket.accept"})
-        await send({"type": "websocket.send", "text": "ready"})
         try:
+            await send({"type": "websocket.send", "text": "ready"})
             while (await receive())["type"] != "websocket.disconnect":
                 pass
         finally:
