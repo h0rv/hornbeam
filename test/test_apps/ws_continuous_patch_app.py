@@ -16,6 +16,7 @@ async def app(scope: Message, receive: Receive, send: Send) -> None:
         await send({"type": "http.response.body", "body": b"ws fixture"})
         return
     assert await receive() == {"type": "websocket.connect"}
+    assert "method" not in scope
     await send({"type": "websocket.accept"})
     await send({"type": "websocket.send", "text": "welcome"})
     extensions = scope["extensions"]
