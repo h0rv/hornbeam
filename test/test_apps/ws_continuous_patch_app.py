@@ -18,6 +18,16 @@ async def app(scope: Message, receive: Receive, send: Send) -> None:
     assert await receive() == {"type": "websocket.connect"}
     assert "method" not in scope
     await send({"type": "websocket.accept"})
+    if scope["path"] == "/cancel-send":
+        async def writer() -> None:
+            await send({"type": "websocket.send", "text": "cancelled-send"})
+
+        async with asyncio.TaskGroup() as group:
+            sender = group.create_task(writer())
+            await asyncio.sleep(0)
+            assert not sender.done()
+            sender.cancel()
+        return
     await send({"type": "websocket.send", "text": "welcome"})
     extensions = scope["extensions"]
     assert isinstance(extensions, dict)

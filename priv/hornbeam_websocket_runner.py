@@ -143,10 +143,17 @@ class WebSocketSession:
         self.pending_output += 1
         try:
             async with self.output_lock:
-                await self.send_message(message)
-        except asyncio.CancelledError:
-            await self.abort_output()
-            raise
+                output = asyncio.create_task(self.send_message(message))
+                try:
+                    await asyncio.shield(output)
+                except asyncio.CancelledError:
+                    while not output.done():
+                        try:
+                            await asyncio.shield(output)
+                        except asyncio.CancelledError:
+                            pass
+                    output.result()
+                    raise
         finally:
             self.pending_output -= 1
 

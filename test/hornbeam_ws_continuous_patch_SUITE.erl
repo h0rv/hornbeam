@@ -8,13 +8,13 @@
          init_per_testcase/2, end_per_testcase/2]).
 -export([idle_output_and_owner/1, five_item_arrays_are_asgi/1,
          native_channels_are_explicit/1, mounted_legacy_topics_are_isolated/1,
-         shutdown_awaits_asgi_cleanup/1]).
+         shutdown_awaits_asgi_cleanup/1, cancelled_sender_closes_normally/1]).
 %% Also act as the ws client's observer handler.
 -export([init/2, handle_in/2, handle_info/2, terminate/2]).
 
 all() -> [idle_output_and_owner, five_item_arrays_are_asgi,
           native_channels_are_explicit, mounted_legacy_topics_are_isolated,
-          shutdown_awaits_asgi_cleanup].
+          shutdown_awaits_asgi_cleanup, cancelled_sender_closes_normally].
 
 init_per_suite(Config) ->
     application:load(hornbeam),
@@ -82,6 +82,14 @@ shutdown_awaits_asgi_cleanup(Config) ->
 
 connect(Config) ->
     connect(Config, "/ws-patch").
+
+cancelled_sender_closes_normally(Config) ->
+    Client = connect(Config, "/cancel-send"),
+    ?assertEqual({text, <<"cancelled-send">>}, next_frame(Client)),
+    receive
+        {ws_patch_closed, Client, Reason} -> ?assertEqual({remote, 1000, <<>>}, Reason)
+    after 3000 -> error(websocket_close_timeout)
+    end.
 
 connect(Config, Path) ->
     Port = proplists:get_value(port, Config),
@@ -174,4 +182,6 @@ handle_in(Frame, Observer) ->
     Observer ! {ws_patch_frame, self(), Frame},
     {ok, Observer}.
 handle_info(_Info, Observer) -> {ok, Observer}.
-terminate(_Reason, _Observer) -> ok.
+terminate(Reason, Observer) ->
+    Observer ! {ws_patch_closed, self(), Reason},
+    ok.
