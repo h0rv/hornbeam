@@ -273,6 +273,39 @@ class ContinuousWebSocketPatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(finalized.is_set())
         self.assertTrue(channel.closed)
 
+    async def test_cancelled_sender_allows_normal_application_close(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def output(name: str, owner: object, relay: object, message: object) -> int:
+            self.output.put_nowait((relay, message))
+            if message == (b"websocket_send", b"text", b"in-flight"):
+                entered.set()
+                await release.wait()
+            return 1
+
+        async def app(scope: Message, receive: Receive, send: Send) -> None:
+            await send({"type": "websocket.accept"})
+
+            async def writer() -> None:
+                await send({"type": "websocket.send", "text": "in-flight"})
+
+            async with asyncio.TaskGroup() as group:
+                sender = group.create_task(writer())
+                await entered.wait()
+                sender.cancel()
+                release.set()
+
+        _bridge.__dict__["async_call"] = output
+        _, task = self.start(app)
+        await self.finish(task)
+        self.assertEqual(await self.frame(), ("ws-pid", (b"websocket_accept", b"")))
+        self.assertEqual(
+            await self.frame(), ("ws-pid", (b"websocket_send", b"text", b"in-flight"))
+        )
+        self.assertEqual(await self.frame(), ("ws-pid", (b"websocket_close", 1000, b"")))
+        self.assertTrue(self.output.empty())
+
     async def test_ready_fast_consumer_handles_native_burst_without_false_overflow(self) -> None:
         seen: list[Message] = []
 

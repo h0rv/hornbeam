@@ -102,15 +102,73 @@ class OutputBackpressureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.aborts, 1)
         self.assertTrue(self.session.closed)
 
-    async def test_cancel_aborts_and_preserves_cancellation(self) -> None:
+    async def test_cancel_finishes_output_and_preserves_cancellation(self) -> None:
         task = asyncio.create_task(
             self.session.send({"type": "websocket.send", "bytes": b"stalled"})
         )
         await self.entered.wait()
         task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertTrue(self.session.output_lock.locked())
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.release.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
+        self.assertEqual(self.aborts, 0)
+        self.assertFalse(self.session.closed)
+        self.assertEqual(self.session.pending_output, 0)
+
+    async def test_cancel_keeps_output_lock_until_frame_finishes(self) -> None:
+        first = asyncio.create_task(
+            self.session.send({"type": "websocket.send", "text": "one"})
+        )
+        await self.entered.wait()
+        first.cancel()
+        second = asyncio.create_task(
+            self.session.send({"type": "websocket.send", "text": "two"})
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(self.messages, [(b"websocket_send", b"text", b"one")])
+        self.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        await second
+        self.assertEqual(self.messages[-1], (b"websocket_send", b"text", b"two"))
+        self.assertEqual(self.aborts, 0)
+        self.assertEqual(self.session.pending_output, 0)
+
+    async def test_cancel_while_waiting_for_lock_does_not_abort(self) -> None:
+        first = asyncio.create_task(
+            self.session.send({"type": "websocket.send", "text": "one"})
+        )
+        await self.entered.wait()
+        second = asyncio.create_task(
+            self.session.send({"type": "websocket.send", "text": "two"})
+        )
+        await asyncio.sleep(0)
+        second.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await second
+        self.assertEqual(self.messages, [(b"websocket_send", b"text", b"one")])
+        self.assertEqual(self.aborts, 0)
+        self.release.set()
+        await first
+        self.assertEqual(self.session.pending_output, 0)
+
+    async def test_cancelled_output_still_times_out_and_aborts(self) -> None:
+        with patch.object(runner, "_OUTPUT_TIMEOUT", 0.01):
+            task = asyncio.create_task(
+                self.session.send({"type": "websocket.send", "bytes": b"stalled"})
+            )
+            await self.entered.wait()
+            task.cancel()
+            with self.assertRaises(OSError):
+                await task
         self.assertEqual(self.aborts, 1)
+        self.assertTrue(self.session.closed)
         self.assertEqual(self.session.pending_output, 0)
 
     async def test_close_awaits_transport_then_rejects_send(self) -> None:
